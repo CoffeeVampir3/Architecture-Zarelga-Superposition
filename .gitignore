@@ -1,0 +1,18 @@
+HCA/refs/
+dataset/
+checkpoints/
+.agents/
+.codex/
+.python-version
+outputs/
+uv.lock
+
+
+# Local artifacts
+__pycache__/
+*.pyc
+.venv/
+checkpoints/
+logs/
+outputs/
+tests/

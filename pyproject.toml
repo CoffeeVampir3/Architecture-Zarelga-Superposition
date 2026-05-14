@@ -1,0 +1,27 @@
+[project]
+name = "moed"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "aim>=3.29.1",
+    "cut-cross-entropy",
+    "einops>=0.8.1",
+    "matplotlib>=3.10.6",
+    "numpy>=2.3.3",
+    "torch>=2.8.0",
+    "transformers>=4.56.1",
+    "tqdm>=4.67.1",
+    "flash-attn>=2.8.3",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.sources]
+cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git" }
