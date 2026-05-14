@@ -28,6 +28,18 @@ class MoEModel(nn.Module):
         nn.init.normal_(self.embedding.weight, mean=0.0, std=self.config.initializer_range)
         nn.init.normal_(self.output_layer.weight, mean=0.0, std=self.config.initializer_range)
 
+    def _embed_tokens(self, x):
+        if x.ndim == 3:
+            bag_size = x.shape[-1]
+            h = self.embedding(x[..., 0])
+            h_dtype = h.dtype
+            h = h.float()
+            for bag_idx in range(1, bag_size):
+                h = h + self.embedding(x[..., bag_idx]).float()
+            return (h / bag_size).to(h_dtype)
+
+        return self.embedding(x)
+
     def _run_layers(self, x, position_ids, cu_seqlens, unpad_indices, max_seqlen):
         all_topk_indices = []
         for layer in self.layers:
@@ -42,14 +54,14 @@ class MoEModel(nn.Module):
         return x, all_topk_indices
 
     def forward(self, x, position_ids=None, cu_seqlens=None, unpad_indices=None, max_seqlen=None):
-        x = self.embedding(x)
+        x = self._embed_tokens(x)
         x, all_topk_indices = self._run_layers(x, position_ids, cu_seqlens, unpad_indices, max_seqlen)
         x = self.norm(x)
         x = self.output_layer(x)
         return x, all_topk_indices
 
     def headless_forward(self, x, position_ids=None, cu_seqlens=None, unpad_indices=None, max_seqlen=None):
-        x = self.embedding(x)
+        x = self._embed_tokens(x)
         x, all_topk_indices = self._run_layers(x, position_ids, cu_seqlens, unpad_indices, max_seqlen)
         x = self.norm(x)
         return x, all_topk_indices

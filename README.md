@@ -21,6 +21,12 @@ Train against pre-tokenized JSONL data under `outputs/` by default:
 uv run python main.py
 ```
 
+Token Superposition Training is implemented as a two-phase schedule. It is off by
+default; enable it in `modeling/model_config.py` by setting
+`token_superposition_bag_size > 1` and `token_superposition_ratio > 0`. During
+the first phase, packed rows use `sequence_length * bag_size` raw-token slots,
+then full token bags are folded into latent tokens before the transformer.
+
 Aim logs to: `logs/aim`
 ```
 uv run aim up --repo logs/aim

@@ -29,6 +29,11 @@ class ModelConfig:
     rope_theta: int = 100000
     initializer_range: float = 0.02
 
+    # Token Superposition Training (TST). Disabled by default; set
+    # token_superposition_ratio > 0 and bag_size > 1 for the first training phase.
+    token_superposition_bag_size: int = 8
+    token_superposition_ratio: float = 0.4
+
     def __post_init__(self):
         self.n_routed_experts = self.n_experts - self.n_shared_experts
 
@@ -50,3 +55,7 @@ class ModelConfig:
             raise ValueError("hca_block_size must be positive.")
         if self.hca_window_size <= 0:
             raise ValueError("hca_window_size must be positive.")
+        if self.token_superposition_bag_size <= 0:
+            raise ValueError("token_superposition_bag_size must be positive.")
+        if not 0.0 <= self.token_superposition_ratio <= 1.0:
+            raise ValueError("token_superposition_ratio must be in [0, 1].")

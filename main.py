@@ -15,6 +15,7 @@ from utils.tokenizer import load_tokenizer
 from modeling.model import MoEModel
 from modeling.model_config import ModelConfig
 from cut_cross_entropy import linear_cross_entropy
+from modeling.mcce_fast_v2 import mcce_raw_token_mean_v2
 
 from modeling.zRMSNorm import ZeroCenteredRMSNorm
 
@@ -174,6 +175,122 @@ def build_next_token_loss_inputs(embeddings, input_ids, attention_mask, loss_mas
     labels = input_ids[:, 1:].masked_fill(~prediction_mask, ignore_index)
     return embeddings[:, :-1, :].contiguous(), labels.contiguous()
 
+def bucket_max_seqlen(max_seqlen, max_length):
+    if max_seqlen <= 0:
+        return 0
+    return min(((max_seqlen + 31) // 32) * 32, max_length)
+
+def build_token_superposition_batch(batch, superposition_bag_size, latent_sequence_length, pad_token_id):
+    """Build a TST batch from the packed raw-token batch.
+
+    Each packed document segment is folded independently so neither source bags
+    nor next-bag labels cross causal reset boundaries.
+    """
+    input_ids = batch["input_ids"]
+    cu_seqlens = batch["cu_seqlens"].tolist()
+    unpad_indices = batch["unpad_indices"]
+
+    if superposition_bag_size <= 1:
+        raise ValueError("superposition_bag_size must be > 1 for TST batches.")
+
+    flat_input_ids = input_ids.flatten()
+    segments = []
+
+    for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+        flat_positions = unpad_indices[start:end]
+        segment_len = int(flat_positions.numel())
+        full_bags = segment_len // superposition_bag_size
+        if full_bags < 2:
+            continue
+
+        token_ids = flat_input_ids[flat_positions[: full_bags * superposition_bag_size]]
+        source_bags = token_ids.view(full_bags, superposition_bag_size).contiguous()
+        if source_bags.size(0) > latent_sequence_length:
+            source_bags = source_bags[:latent_sequence_length]
+
+        # Source bag j predicts the raw tokens in source bag j + 1.
+        label_count = max(0, source_bags.size(0) - 1)
+        if label_count == 0:
+            continue
+
+        segments.append((source_bags, source_bags[1:].contiguous()))
+
+    if not segments:
+        return None
+
+    # First-Fit Decreasing: sort segments by descending bag count, then place
+    # each into the first open row with room. Opens a new row only when no
+    # existing row fits.
+    segments.sort(key=lambda sl: sl[0].size(0), reverse=True)
+
+    rows = []  # each entry: [list_of_(source_bags, labels), current_len]
+    for source_bags, labels in segments:
+        seg_len = source_bags.size(0)
+        placed = False
+        for row in rows:
+            if row[1] + seg_len <= latent_sequence_length:
+                row[0].append((source_bags, labels))
+                row[1] += seg_len
+                placed = True
+                break
+        if not placed:
+            rows.append([[(source_bags, labels)], seg_len])
+
+    rows = [row[0] for row in rows]
+
+    batch_size = len(rows)
+    input_bags = torch.full(
+        (batch_size, latent_sequence_length, superposition_bag_size),
+        pad_token_id,
+        dtype=input_ids.dtype,
+    )
+    attention_mask = torch.zeros((batch_size, latent_sequence_length), dtype=torch.bool)
+    position_ids = torch.zeros((batch_size, latent_sequence_length), dtype=torch.long)
+
+    packed_labels = []
+    loss_indices = []
+    cu_bag_seqlens = [0]
+    unpad_bag_indices = []
+    max_seqlen = 0
+
+    for row_idx, row_segments in enumerate(rows):
+        cursor = 0
+        for source_bags, labels in row_segments:
+            seg_len = source_bags.size(0)
+            segment_end = cursor + seg_len
+
+            input_bags[row_idx, cursor:segment_end] = source_bags
+            attention_mask[row_idx, cursor:segment_end] = True
+            position_ids[row_idx, cursor:segment_end] = torch.arange(seg_len, dtype=torch.long)
+            unpad_bag_indices.extend(
+                range(row_idx * latent_sequence_length + cursor, row_idx * latent_sequence_length + segment_end)
+            )
+            cu_bag_seqlens.append(cu_bag_seqlens[-1] + seg_len)
+            max_seqlen = max(max_seqlen, seg_len)
+
+            label_count = labels.size(0)
+            packed_labels.append(labels)
+            loss_indices.extend(
+                range(row_idx * latent_sequence_length + cursor, row_idx * latent_sequence_length + cursor + label_count)
+            )
+
+            cursor = segment_end
+
+    labels = torch.cat(packed_labels, dim=0).contiguous()
+    s = torch.full((labels.size(0),), superposition_bag_size, dtype=torch.int32)
+
+    return {
+        "input_ids": input_bags,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "cu_seqlens": torch.tensor(cu_bag_seqlens, dtype=torch.int32),
+        "unpad_indices": torch.tensor(unpad_bag_indices, dtype=torch.long),
+        "max_seqlen": bucket_max_seqlen(max_seqlen, latent_sequence_length),
+        "loss_indices": torch.tensor(loss_indices, dtype=torch.long),
+        "labels": labels,
+        "s": s,
+    }
+
 def build_weight_decay_optm(model, learning_rate, weight_decay=0.01, betas=(0.9, 0.95)):
     zero_centered_rmsnorm_params = []
     decay_params = []
@@ -254,6 +371,8 @@ def train(
     update_rate=1e-5,
     checkpoint_interval_steps=10_000,
     max_rolling_checkpoints=5,
+    superposition_bag_size=1,
+    superposition_ratio=0.0,
 ):
     device = torch.device("cuda")
     model.to(device)
@@ -262,6 +381,10 @@ def train(
     optimizer_betas = (0.9, 0.95)
     optimizer = build_weight_decay_optm(model, learning_rate, weight_decay=weight_decay, betas=optimizer_betas)
 
+    use_superposition = superposition_bag_size > 1 and superposition_ratio > 0.0
+    superposition_ratio = min(max(float(superposition_ratio), 0.0), 1.0)
+    superposition_raw_length = sequence_length * superposition_bag_size
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -269,6 +392,15 @@ def train(
         drop_last=True,
         collate_fn=PackedTokenizedCollator(sequence_length, tokenizer.pad_token_id),
     )
+    superposition_loader = None
+    if use_superposition:
+        superposition_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            collate_fn=PackedTokenizedCollator(superposition_raw_length, tokenizer.pad_token_id),
+        )
 
     checkpoint_dir = Path("checkpoints")
     checkpoint_dir.mkdir(exist_ok=True)
@@ -278,6 +410,7 @@ def train(
     global_step = 0
 
     total_steps = len(train_loader) * num_epochs
+    superposition_steps = int(total_steps * superposition_ratio) if use_superposition else 0
     warmup_steps = min(500, max(1, total_steps // 20))
     scheduler = CosineWarmupScheduler(
         optimizer,
@@ -301,14 +434,83 @@ def train(
         'train_examples': len(train_dataset),
         'checkpoint_interval_steps': checkpoint_interval_steps,
         'max_rolling_checkpoints': max_rolling_checkpoints,
+        'token_superposition/enabled': use_superposition,
+        'token_superposition/bag_size': superposition_bag_size,
+        'token_superposition/ratio': superposition_ratio,
+        'token_superposition/steps': superposition_steps,
+        'token_superposition/raw_sequence_length': superposition_raw_length if use_superposition else None,
     })
 
-    for epoch in range(num_epochs):
-        model.train()
-        total_loss = 0
-        epoch_start_time = time.time()
+    def next_from_loader(loader, iterator):
+        try:
+            return next(iterator), iterator
+        except StopIteration:
+            iterator = iter(loader)
+            return next(iterator), iterator
 
-        for batch_idx, batch in enumerate(tqdm(train_loader)):
+    def next_superposition_batch(loader, iterator):
+        for _ in range(max(1, len(loader))):
+            raw_batch, iterator = next_from_loader(loader, iterator)
+            tst_batch = build_token_superposition_batch(
+                raw_batch,
+                superposition_bag_size,
+                sequence_length,
+                tokenizer.pad_token_id,
+            )
+            if tst_batch is not None:
+                return tst_batch, iterator
+        raise RuntimeError(
+            "Could not build a TST batch with at least two full token bags per packed segment. "
+            "Use a smaller token_superposition_bag_size or longer tokenized chunks."
+        )
+
+    model.train()
+    total_loss = 0.0
+    phase_loss = 0.0
+    phase_steps = 0
+    train_start_time = time.time()
+    standard_iter = iter(train_loader)
+    superposition_iter = iter(superposition_loader) if superposition_loader is not None else None
+    current_phase = "tst" if superposition_steps > 0 else "recovery"
+
+    for step_idx in tqdm(range(total_steps)):
+        in_superposition_phase = step_idx < superposition_steps
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
+
+        if in_superposition_phase:
+            batch, superposition_iter = next_superposition_batch(superposition_loader, superposition_iter)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            position_ids = batch["position_ids"].to(device)
+            cu_seqlens = batch["cu_seqlens"].to(device)
+            unpad_indices = batch["unpad_indices"].to(device)
+            max_seqlen = batch["max_seqlen"]
+            loss_indices = batch["loss_indices"].to(device)
+            labels = batch["labels"].to(device)
+            s = batch["s"].to(device)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                embeddings, all_topk_indices = model.headless_forward(
+                    input_ids,
+                    position_ids=position_ids,
+                    cu_seqlens=cu_seqlens,
+                    unpad_indices=unpad_indices,
+                    max_seqlen=max_seqlen,
+                )
+                classifier = model.get_classifier_weights()
+                loss_embeddings = embeddings.reshape(-1, embeddings.size(-1)).index_select(0, loss_indices)
+                loss = mcce_raw_token_mean_v2(
+                    loss_embeddings,
+                    classifier,
+                    labels,
+                    s,
+                    check_label_values=False,
+                )
+            phase = "tst"
+            batch_idx = step_idx
+        else:
+            batch, standard_iter = next_from_loader(train_loader, standard_iter)
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             loss_mask = batch["loss_mask"].to(device)
@@ -316,8 +518,6 @@ def train(
             cu_seqlens = batch["cu_seqlens"].to(device)
             unpad_indices = batch["unpad_indices"].to(device)
             max_seqlen = batch["max_seqlen"]
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 embeddings, all_topk_indices = model.headless_forward(
@@ -335,44 +535,83 @@ def train(
                     loss_mask=loss_mask,
                 )
                 loss = linear_cross_entropy(loss_embeddings, classifier, labels, ignore_index=-100)
+            phase = "recovery"
+            batch_idx = step_idx - superposition_steps
 
-            loss.backward()
-            optimizer.step()
+        if phase != current_phase and phase_steps > 0:
+            avg_phase_loss = phase_loss / phase_steps
+            print(f"Phase {current_phase}: {phase_steps} steps, Loss: {avg_phase_loss:.4f}")
+            logger.log(
+                {
+                    f"loss/{current_phase}_phase_loss": avg_phase_loss,
+                    f"training/{current_phase}_phase_steps": phase_steps,
+                },
+                step=global_step,
+                detailed_logging=True,
+            )
+            current_phase = phase
+            phase_loss = 0.0
+            phase_steps = 0
 
-            total_loss += loss.item()
-            auxillary_loss_free_update(model, all_topk_indices, update_rate, attention_mask)
+        loss.backward()
+        optimizer.step()
 
-            metrics = logger.log_training_metrics(loss, optimizer, update_rate, global_step, epoch, batch_idx)
-            metrics.update(logger.log_moe_metrics(all_topk_indices, global_step, attention_mask))
+        loss_value = loss.item()
+        total_loss += loss_value
+        phase_loss += loss_value
+        phase_steps += 1
+        auxillary_loss_free_update(model, all_topk_indices, update_rate, attention_mask)
 
-            detailed_logging = (global_step % logger.detailed_frequency == 0)
-            logger.log(metrics, step=global_step, model=model, detailed_logging=detailed_logging)
+        epoch = step_idx // max(1, len(train_loader))
+        metrics = logger.log_training_metrics(loss, optimizer, update_rate, global_step, epoch, batch_idx)
+        metrics.update(logger.log_moe_metrics(all_topk_indices, global_step, attention_mask))
+        metrics["training/phase"] = 0 if phase == "tst" else 1
+        if phase == "tst":
+            metrics["token_superposition/active_labels"] = labels.numel()
 
-            global_step += 1
+        detailed_logging = (global_step % logger.detailed_frequency == 0)
+        logger.log(metrics, step=global_step, model=model, detailed_logging=detailed_logging)
 
-            if checkpoint_interval_steps > 0 and global_step % checkpoint_interval_steps == 0:
-                checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step}.safetensors"
-                save_checkpoint(
-                    model,
-                    optimizer,
-                    str(checkpoint_path),
-                    scheduler=scheduler,
-                    global_step=global_step,
-                    epoch=epoch + 1,
-                )
-                prune_rolling_checkpoints(checkpoint_dir, max_rolling_checkpoints)
-                print(f"Checkpoint saved: {checkpoint_path}")
+        global_step += 1
 
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+        if global_step == total_steps and phase_steps > 0:
+            avg_phase_loss = phase_loss / phase_steps
+            print(f"Phase {current_phase}: {phase_steps} steps, Loss: {avg_phase_loss:.4f}")
+            logger.log(
+                {
+                    f"loss/{current_phase}_phase_loss": avg_phase_loss,
+                    f"training/{current_phase}_phase_steps": phase_steps,
+                },
+                step=global_step,
+                detailed_logging=True,
+            )
+            phase_loss = 0.0
+            phase_steps = 0
 
-        epoch_time = time.time() - epoch_start_time
-        epoch_metrics = {
-            'loss/epoch_loss': avg_loss,
-            'training/epoch_time': epoch_time,
-            'training/batches_per_epoch': len(train_loader),
-        }
-        logger.log(epoch_metrics, step=global_step, detailed_logging=True)
+        if checkpoint_interval_steps > 0 and global_step % checkpoint_interval_steps == 0:
+            checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step}.safetensors"
+            save_checkpoint(
+                model,
+                optimizer,
+                str(checkpoint_path),
+                scheduler=scheduler,
+                global_step=global_step,
+                epoch=epoch + 1,
+            )
+            prune_rolling_checkpoints(checkpoint_dir, max_rolling_checkpoints)
+            print(f"Checkpoint saved: {checkpoint_path}")
+
+    avg_loss = total_loss / max(1, total_steps)
+    train_time = time.time() - train_start_time
+    logger.log(
+        {
+            'loss/train_loss': avg_loss,
+            'training/train_time': train_time,
+            'training/total_steps': total_steps,
+        },
+        step=global_step,
+        detailed_logging=True,
+    )
 
     final_checkpoint_path = checkpoint_dir / "checkpoint_final.safetensors"
     save_checkpoint(
@@ -388,14 +627,26 @@ def train(
     logger.close()
 
 def main():
-    train_dataset, tokenizer, sequence_length = load_and_preprocess_data()
+    config = ModelConfig()
+    data_max_length = config.sequence_length
+    if config.token_superposition_bag_size > 1 and config.token_superposition_ratio > 0.0:
+        data_max_length = config.sequence_length * config.token_superposition_bag_size
+
+    train_dataset, tokenizer, _ = load_and_preprocess_data(max_length=data_max_length)
     config = ModelConfig(vocab_size=len(tokenizer))
 
     model = MoEModel(config)
 
     count_parameters_layerwise(model)
-    model.headless_forward = torch.compile(model.headless_forward, mode="reduce-overhead", dynamic=True)
-    train(model, train_dataset, tokenizer, sequence_length)
+    model.headless_forward = torch.compile(model.headless_forward, dynamic=True)
+    train(
+        model,
+        train_dataset,
+        tokenizer,
+        config.sequence_length,
+        superposition_bag_size=config.token_superposition_bag_size,
+        superposition_ratio=config.token_superposition_ratio,
+    )
 
 if __name__ == "__main__":
     main()
