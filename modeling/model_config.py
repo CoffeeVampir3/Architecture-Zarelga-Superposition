@@ -1,8 +1,14 @@
+import math
 from dataclasses import dataclass, field
 
 SUPERPOSITION_REFERENCE_SIZE = 1
 SUPERPOSITION_TRAINING_MAX_SIZE = 16
 SUPERPOSITION_SCHEDULE_BETA = 2.0
+
+# S-RoPE base frequencies (one per 2D pair on the S-band). Chosen so that
+# log2(s) * omega for s in {1, 2, 4, 8, 16} gives well-separated angles on the
+# torus with no aliasing -- (pi/3, pi/4) covers {0..4} cleanly on both pairs.
+S_ROPE_DEFAULT_FREQS = (math.pi / 3, math.pi / 4)
 
 
 def set_superposition(params, enabled=False):
@@ -17,13 +23,13 @@ def set_superposition(params, enabled=False):
 @dataclass
 class ModelConfig:
     vocab_size: int = 8192
-    embed_size: int = 256
-    hidden_size: int = 256
+    embed_size: int = 512
+    hidden_size: int = 512
 
     transformer_depth: int = 5
 
     # MoE
-    intermediate_size: int = 256+64
+    intermediate_size: int = 640
     n_experts: int = 8
     n_shared_experts: int = 2
     n_experts_per_token: int = 3
@@ -40,9 +46,16 @@ class ModelConfig:
     rms_norm_eps: float = 1e-6
     max_position_embeddings: int = 1024
     sequence_length: int = 256
-    rope_theta: int = 100000
-    do_rope: bool = False
+    rope_theta: int = 1000
+    do_rope: bool = True
     initializer_range: float = 0.02
+
+    # Three-band rotation partition over head_dim. Sum must not exceed head_dim;
+    # remainder is NoPE. pos_rope_dims is symmetric RoPE on Q+K (relative position).
+    # s_rope_dims is asymmetric on K only (absolute log2(s) regime tag).
+    pos_rope_dims: int = 12
+    s_rope_dims: int = 4
+    s_rope_freqs: tuple = S_ROPE_DEFAULT_FREQS
 
     # Token Superposition Training (TST). Per-step s is sampled from a
     # categorical over {1, 2, 4, ..., superposition_max_size} (powers of 2).
@@ -77,3 +90,19 @@ class ModelConfig:
             raise ValueError("superposition_max_size must be a positive power of 2.")
         if self.superposition_schedule_beta < 0.0:
             raise ValueError("superposition_schedule_beta must be non-negative.")
+
+        head_dim = self.hidden_size // self.n_attention_heads
+        if self.pos_rope_dims < 0 or self.s_rope_dims < 0:
+            raise ValueError("pos_rope_dims and s_rope_dims must be non-negative.")
+        if self.pos_rope_dims % 2 != 0 or self.s_rope_dims % 2 != 0:
+            raise ValueError("pos_rope_dims and s_rope_dims must be even (2D rotation pairs).")
+        if self.pos_rope_dims + self.s_rope_dims > head_dim:
+            raise ValueError(
+                f"pos_rope_dims + s_rope_dims ({self.pos_rope_dims + self.s_rope_dims}) "
+                f"cannot exceed head_dim ({head_dim})."
+            )
+        if len(self.s_rope_freqs) * 2 != self.s_rope_dims:
+            raise ValueError(
+                f"s_rope_freqs must have s_rope_dims/2 = {self.s_rope_dims // 2} entries, "
+                f"got {len(self.s_rope_freqs)}."
+            )

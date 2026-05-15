@@ -1,3 +1,4 @@
+import math
 from flash_attn import flash_attn_varlen_func
 from flash_attn.bert_padding import index_first_axis, pad_input
 from typing import Optional
@@ -37,18 +38,39 @@ class GatedAttention(nn.Module):
         self.head_gate_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
         self.reset_parameters()
 
+        # Three-band rotation partition over head_dim:
+        #   pairs [0 .. pos_pairs)                  : position-RoPE (symmetric Q+K)
+        #   pairs [pos_pairs .. pos_pairs+s_pairs)  : S-RoPE (asymmetric, K only)
+        #   pairs [pos_pairs+s_pairs .. head_dim/2) : NoPE (identity on both)
+        self.pos_rope_dims = config.pos_rope_dims
+        self.s_rope_dims = config.s_rope_dims
+        self.pos_rope_pairs = config.pos_rope_dims // 2
+        self.s_rope_pairs = config.s_rope_dims // 2
+        self.s_rope_freqs = tuple(config.s_rope_freqs)
+        # S-table indexed by log2(s); s_max determines table size.
+        s_max = max(1, int(config.superposition_max_size))
+        self.s_log2_max = max(0, int(round(math.log2(s_max))))
+        self.s_table_size = self.s_log2_max + 1
+
         if self.do_rope:
-            cos_cached, sin_cached = self._compute_rope_embeddings(
+            pos_cos, pos_sin = self._build_pos_rope_tables(
                 self.max_position_embeddings,
                 self.head_dim,
                 self.rope_theta,
                 dtype=torch.float32,
                 device=self.q_proj.weight.device,
             )
+            s_cos, s_sin = self._build_s_rope_tables(
+                self.head_dim,
+                dtype=torch.float32,
+                device=self.q_proj.weight.device,
+            )
         else:
-            cos_cached, sin_cached = None, None
-        self.register_buffer("cos_cached", cos_cached, persistent=False)
-        self.register_buffer("sin_cached", sin_cached, persistent=False)
+            pos_cos = pos_sin = s_cos = s_sin = None
+        self.register_buffer("pos_cos_cache", pos_cos, persistent=False)
+        self.register_buffer("pos_sin_cache", pos_sin, persistent=False)
+        self.register_buffer("s_cos_cache", s_cos, persistent=False)
+        self.register_buffer("s_sin_cache", s_sin, persistent=False)
 
     def reset_parameters(self):
         nn.init.normal_(self.q_proj.weight, mean=0.0, std=self.initializer_range)
@@ -57,14 +79,48 @@ class GatedAttention(nn.Module):
         nn.init.normal_(self.o_proj.weight, mean=0.0, std=self.initializer_range)
         nn.init.normal_(self.head_gate_proj.weight, mean=0.0, std=self.initializer_range)
 
-    def _compute_rope_embeddings(self, max_position_embeddings, head_dim, base=10000, dtype=None, device=None):
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+    def _build_pos_rope_tables(self, max_position_embeddings, head_dim, base, dtype, device):
+        """Position-RoPE cos/sin on the first `pos_rope_pairs` 2D pairs.
+
+        Tables are shaped [max_pos, head_dim/2]; identity (cos=1, sin=0) outside
+        the position band so the kernel's rotation on those pairs is a no-op.
+        """
+        half = head_dim // 2
+        cos_table = torch.ones(max_position_embeddings, half, dtype=dtype, device=device)
+        sin_table = torch.zeros(max_position_embeddings, half, dtype=dtype, device=device)
+        if self.pos_rope_pairs == 0:
+            return cos_table, sin_table
+
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, self.pos_rope_dims, 2, device=device, dtype=torch.float32) / self.pos_rope_dims)
+        )
         t = torch.arange(max_position_embeddings, device=device, dtype=torch.float32)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().to(dtype)
-        sin = emb.sin().to(dtype)
-        return cos.unsqueeze(0), sin.unsqueeze(0)
+        freqs = torch.outer(t, inv_freq)  # [max_pos, pos_pairs]
+        cos_table[:, : self.pos_rope_pairs] = freqs.cos().to(dtype)
+        sin_table[:, : self.pos_rope_pairs] = freqs.sin().to(dtype)
+        return cos_table, sin_table
+
+    def _build_s_rope_tables(self, head_dim, dtype, device):
+        """S-RoPE cos/sin on the `s_rope_pairs` pairs after the position band.
+
+        Indexed by log2(s) (rows: 0, 1, ..., s_log2_max). Identity outside the
+        s band. These tables drive the K-side rotation only -- Q's S-band stays
+        at identity (provided via the pos table, which is identity there).
+        """
+        half = head_dim // 2
+        cos_table = torch.ones(self.s_table_size, half, dtype=dtype, device=device)
+        sin_table = torch.zeros(self.s_table_size, half, dtype=dtype, device=device)
+        if self.s_rope_pairs == 0:
+            return cos_table, sin_table
+
+        log_s = torch.arange(self.s_table_size, device=device, dtype=torch.float32)  # [s_table]
+        omegas = torch.tensor(self.s_rope_freqs, device=device, dtype=torch.float32)  # [s_pairs]
+        angles = log_s.unsqueeze(1) * omegas.unsqueeze(0)  # [s_table, s_pairs]
+        start = self.pos_rope_pairs
+        end = self.pos_rope_pairs + self.s_rope_pairs
+        cos_table[:, start:end] = angles.cos().to(dtype)
+        sin_table[:, start:end] = angles.sin().to(dtype)
+        return cos_table, sin_table
 
     def _flash_attention_varlen(
         self,
@@ -134,6 +190,7 @@ class GatedAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
+        s_value: int = 1,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         unpad_indices: Optional[torch.Tensor] = None,
@@ -154,16 +211,28 @@ class GatedAttention(nn.Module):
         value_states = rearrange(value_states, "b s (h d) -> b s h d", h=self.num_key_value_heads, d=self.head_dim)
 
         if self.do_rope:
-            # Slice off position specific rope freqs from the cached freqs.
-            cos = self.cos_cached[:, position_ids]  # [1, bsz, seq_len, dim]
-            sin = self.sin_cached[:, position_ids]  # [1, bsz, seq_len, dim]
+            # Pos band: same cos/sin for Q and K (symmetric rotation).
+            # S band: identity on Q (already baked into pos_*_cache outside pos band),
+            #         log2(s)-driven rotation on K (assembled from s_*_cache).
+            q_cos = self.pos_cos_cache[position_ids]   # [bsz, seq_len, head_dim/2]
+            q_sin = self.pos_sin_cache[position_ids]
+            k_cos = q_cos.clone()
+            k_sin = q_sin.clone()
+            if self.s_rope_pairs > 0:
+                log_s = int(round(math.log2(max(1, int(s_value)))))
+                log_s = max(0, min(log_s, self.s_log2_max))
+                start = self.pos_rope_pairs
+                end = start + self.s_rope_pairs
+                k_cos[..., start:end] = self.s_cos_cache[log_s, start:end]
+                k_sin[..., start:end] = self.s_sin_cache[log_s, start:end]
 
             query_states, key_states = LigerRopeFunction.apply(
                 query_states,
                 key_states,
-                cos.squeeze(0),
-                sin.squeeze(0),
-                position_ids
+                q_cos,
+                q_sin,
+                k_cos,
+                k_sin,
             )
 
         attn_output = self._flash_attention_varlen(

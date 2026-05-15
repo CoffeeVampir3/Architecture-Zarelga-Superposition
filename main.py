@@ -554,6 +554,7 @@ def train(
                 embeddings, all_topk_indices = model.headless_forward(
                     input_ids,
                     position_ids=position_ids,
+                    s_value=1,
                     cu_seqlens=cu_seqlens,
                     unpad_indices=unpad_indices,
                     max_seqlen=max_seqlen,
@@ -588,6 +589,7 @@ def train(
                 embeddings, all_topk_indices = model.headless_forward(
                     input_ids,
                     position_ids=position_ids,
+                    s_value=s,
                     cu_seqlens=cu_seqlens,
                     unpad_indices=unpad_indices,
                     max_seqlen=max_seqlen,
@@ -672,11 +674,11 @@ def train(
     logger.close()
 
 def main():
-    config = set_superposition(ModelConfig(), enabled=False)
+    config = set_superposition(ModelConfig(), enabled=True)
     data_max_length = config.sequence_length * max(config.superposition_max_size, 1)
 
     train_dataset, tokenizer, _ = load_and_preprocess_data(max_length=data_max_length)
-    config = set_superposition(ModelConfig(vocab_size=len(tokenizer)), enabled=False)
+    config = set_superposition(ModelConfig(vocab_size=len(tokenizer)), enabled=True)
 
     model = MoEModel(config)
 

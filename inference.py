@@ -46,7 +46,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
-    parser.add_argument("--prompt", default="Bang! And they turned, ")
+    parser.add_argument("--prompt", default="The capital of France")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     args = parser.parse_args()
 

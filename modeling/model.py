@@ -35,12 +35,13 @@ class MoEModel(nn.Module):
 
         return self.embedding(x)
 
-    def _run_layers(self, x, position_ids, cu_seqlens, unpad_indices, max_seqlen):
+    def _run_layers(self, x, position_ids, s_value, cu_seqlens, unpad_indices, max_seqlen):
         all_topk_indices = []
         for layer in self.layers:
             x, topk_idx = layer(
                 x,
                 position_ids=position_ids,
+                s_value=s_value,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 unpad_indices=unpad_indices,
@@ -48,16 +49,16 @@ class MoEModel(nn.Module):
             all_topk_indices.append(topk_idx)
         return x, all_topk_indices
 
-    def forward(self, x, position_ids=None, cu_seqlens=None, unpad_indices=None, max_seqlen=None):
+    def forward(self, x, position_ids=None, s_value=1, cu_seqlens=None, unpad_indices=None, max_seqlen=None):
         x = self._embed_tokens(x)
-        x, all_topk_indices = self._run_layers(x, position_ids, cu_seqlens, unpad_indices, max_seqlen)
+        x, all_topk_indices = self._run_layers(x, position_ids, s_value, cu_seqlens, unpad_indices, max_seqlen)
         x = self.norm(x)
         x = self.output_layer(x)
         return x, all_topk_indices
 
-    def headless_forward(self, x, position_ids=None, cu_seqlens=None, unpad_indices=None, max_seqlen=None):
+    def headless_forward(self, x, position_ids=None, s_value=1, cu_seqlens=None, unpad_indices=None, max_seqlen=None):
         x = self._embed_tokens(x)
-        x, all_topk_indices = self._run_layers(x, position_ids, cu_seqlens, unpad_indices, max_seqlen)
+        x, all_topk_indices = self._run_layers(x, position_ids, s_value, cu_seqlens, unpad_indices, max_seqlen)
         x = self.norm(x)
         return x, all_topk_indices
 

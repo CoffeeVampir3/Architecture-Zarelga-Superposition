@@ -20,6 +20,7 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states,
         position_ids=None,
+        s_value=1,
         cu_seqlens=None,
         max_seqlen=None,
         unpad_indices=None,
@@ -31,6 +32,7 @@ class TransformerBlock(nn.Module):
         hidden_states = self.self_attn(
             hidden_states,
             position_ids=position_ids,
+            s_value=s_value,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             unpad_indices=unpad_indices,
