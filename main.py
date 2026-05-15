@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
 import math
+import random
 import time
 import json
 from torch.utils.data import DataLoader, Dataset
@@ -175,10 +176,75 @@ def build_next_token_loss_inputs(embeddings, input_ids, attention_mask, loss_mas
     labels = input_ids[:, 1:].masked_fill(~prediction_mask, ignore_index)
     return embeddings[:, :-1, :].contiguous(), labels.contiguous()
 
+def bag_label_entropy_floor(labels, s):
+    """Return the irreducible per-raw-token entropy of each target bag."""
+    if labels.numel() == 0:
+        return torch.zeros((), device=labels.device, dtype=torch.float32)
+
+    labels = labels.long()
+    s_f = s.float()
+    cols = torch.arange(labels.size(1), device=labels.device)[None, :]
+    active = cols < s[:, None]
+
+    inactive_label = labels.new_full((), -1)
+    sorted_labels = torch.where(active, labels, inactive_label).sort(dim=1).values
+    sorted_active = sorted_labels >= 0
+    first_col = torch.ones((labels.size(0), 1), device=labels.device, dtype=torch.bool)
+    run_start = sorted_active & torch.cat([first_col, sorted_labels[:, 1:] != sorted_labels[:, :-1]], dim=1)
+    run_ids = (run_start.cumsum(dim=1) - 1).clamp_min(0)
+
+    counts = torch.zeros_like(s_f[:, None].expand_as(labels), dtype=torch.float32)
+    counts.scatter_add_(1, run_ids, sorted_active.float())
+    probs = counts / s_f[:, None].clamp_min(1.0)
+    entropy_terms = torch.where(
+        counts > 0,
+        -probs * torch.log(probs.clamp_min(torch.finfo(torch.float32).tiny)),
+        torch.zeros_like(probs),
+    )
+    row_entropy = entropy_terms.sum(dim=-1)
+    total_raw = s_f.sum().clamp_min(1.0)
+    return (row_entropy * s_f).sum() / total_raw
+
+def ce_equivalent_reducible_loss(raw_loss, vocab_size, entropy_floor):
+    """Map bag CE onto the same scale as ordinary single-token CE."""
+    entropy_floor = entropy_floor.to(device=raw_loss.device, dtype=raw_loss.dtype).detach()
+    random_loss = raw_loss.new_tensor(math.log(vocab_size))
+    reducible_gap = (random_loss - entropy_floor).clamp_min(1e-6)
+    return (raw_loss - entropy_floor) * (random_loss / reducible_gap), reducible_gap
+
 def bucket_max_seqlen(max_seqlen, max_length):
     if max_seqlen <= 0:
         return 0
     return min(((max_seqlen + 31) // 32) * 32, max_length)
+
+def sample_superposition_size(t: float, max_size: int, beta: float) -> int:
+    """Sample s ∈ {1, 2, 4, ..., effective_max} from a schedule-dependent categorical.
+
+    Two schedules compose:
+      1. Bucket ejection: every 20% of training, drop the currently-largest
+         bucket from the support. So at t ∈ [0, 0.2) the support is the full
+         {1, 2, …, max_size}; at t ∈ [0.2, 0.4) the top is removed; etc. Once
+         the support collapses to {1}, s=1 is forced.
+      2. Within the remaining support, sample with logits β · (1 − 2t) · log2(s).
+         At t=0 large s is favored, at t=0.5 the distribution over remaining
+         buckets is uniform, at t=1 small s is favored.
+    """
+    if max_size <= 1:
+        return 1
+    log2_max = int(math.log2(max_size))
+    drops = min(int(t / 0.2), log2_max)
+    effective_log2_max = log2_max - drops
+    if effective_log2_max <= 0:
+        return 1
+    sizes = [1 << k for k in range(effective_log2_max + 1)]
+    coef = beta * (1.0 - 2.0 * t)
+    logits = [coef * k for k in range(effective_log2_max + 1)]
+    m = max(logits)
+    exps = [math.exp(l - m) for l in logits]
+    z = sum(exps)
+    weights = [e / z for e in exps]
+    return random.choices(sizes, weights=weights, k=1)[0]
+
 
 def build_token_superposition_batch(batch, superposition_bag_size, latent_sequence_length, pad_token_id):
     """Build a TST batch from the packed raw-token batch.
@@ -371,8 +437,8 @@ def train(
     update_rate=1e-5,
     checkpoint_interval_steps=10_000,
     max_rolling_checkpoints=5,
-    superposition_bag_size=1,
-    superposition_ratio=0.0,
+    superposition_max_size=16,
+    superposition_schedule_beta=2.0,
 ):
     device = torch.device("cuda")
     model.to(device)
@@ -381,26 +447,19 @@ def train(
     optimizer_betas = (0.9, 0.95)
     optimizer = build_weight_decay_optm(model, learning_rate, weight_decay=weight_decay, betas=optimizer_betas)
 
-    use_superposition = superposition_bag_size > 1 and superposition_ratio > 0.0
-    superposition_ratio = min(max(float(superposition_ratio), 0.0), 1.0)
-    superposition_raw_length = sequence_length * superposition_bag_size
+    superposition_enabled = superposition_max_size > 1
+    superposition_raw_length = sequence_length * max(superposition_max_size, 1)
 
+    # Single dataloader; collator.max_length is mutated per-step to the
+    # sampled s. Safe because num_workers defaults to 0 (synchronous collate).
+    collator = PackedTokenizedCollator(sequence_length, tokenizer.pad_token_id)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        collate_fn=PackedTokenizedCollator(sequence_length, tokenizer.pad_token_id),
+        collate_fn=collator,
     )
-    superposition_loader = None
-    if use_superposition:
-        superposition_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=True,
-            collate_fn=PackedTokenizedCollator(superposition_raw_length, tokenizer.pad_token_id),
-        )
 
     checkpoint_dir = Path("checkpoints")
     checkpoint_dir.mkdir(exist_ok=True)
@@ -410,7 +469,6 @@ def train(
     global_step = 0
 
     total_steps = len(train_loader) * num_epochs
-    superposition_steps = int(total_steps * superposition_ratio) if use_superposition else 0
     warmup_steps = min(500, max(1, total_steps // 20))
     scheduler = CosineWarmupScheduler(
         optimizer,
@@ -434,11 +492,11 @@ def train(
         'train_examples': len(train_dataset),
         'checkpoint_interval_steps': checkpoint_interval_steps,
         'max_rolling_checkpoints': max_rolling_checkpoints,
-        'token_superposition/enabled': use_superposition,
-        'token_superposition/bag_size': superposition_bag_size,
-        'token_superposition/ratio': superposition_ratio,
-        'token_superposition/steps': superposition_steps,
-        'token_superposition/raw_sequence_length': superposition_raw_length if use_superposition else None,
+        'token_superposition/enabled': superposition_enabled,
+        'token_superposition/max_size': superposition_max_size,
+        'token_superposition/schedule_beta': superposition_schedule_beta,
+        'token_superposition/max_raw_sequence_length': superposition_raw_length,
+        'loss/normalization': 'ce_equivalent_reducible_loss',
     })
 
     def next_from_loader(loader, iterator):
@@ -448,69 +506,36 @@ def train(
             iterator = iter(loader)
             return next(iterator), iterator
 
-    def next_superposition_batch(loader, iterator):
+    def next_tst_batch(s_value, loader, iterator):
+        # Try up to len(loader) raw batches before giving up; some raw batches
+        # may have no segment long enough to produce a TST batch at this s.
         for _ in range(max(1, len(loader))):
             raw_batch, iterator = next_from_loader(loader, iterator)
             tst_batch = build_token_superposition_batch(
                 raw_batch,
-                superposition_bag_size,
+                s_value,
                 sequence_length,
                 tokenizer.pad_token_id,
             )
             if tst_batch is not None:
                 return tst_batch, iterator
-        raise RuntimeError(
-            "Could not build a TST batch with at least two full token bags per packed segment. "
-            "Use a smaller token_superposition_bag_size or longer tokenized chunks."
-        )
+        return None, iterator
 
     model.train()
     total_loss = 0.0
-    phase_loss = 0.0
-    phase_steps = 0
     train_start_time = time.time()
-    standard_iter = iter(train_loader)
-    superposition_iter = iter(superposition_loader) if superposition_loader is not None else None
-    current_phase = "tst" if superposition_steps > 0 else "recovery"
+    train_iter = iter(train_loader)
 
     for step_idx in tqdm(range(total_steps)):
-        in_superposition_phase = step_idx < superposition_steps
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
 
-        if in_superposition_phase:
-            batch, superposition_iter = next_superposition_batch(superposition_loader, superposition_iter)
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            position_ids = batch["position_ids"].to(device)
-            cu_seqlens = batch["cu_seqlens"].to(device)
-            unpad_indices = batch["unpad_indices"].to(device)
-            max_seqlen = batch["max_seqlen"]
-            loss_indices = batch["loss_indices"].to(device)
-            labels = batch["labels"].to(device)
-            s = batch["s"].to(device)
+        t = step_idx / max(1, total_steps - 1)
+        s = sample_superposition_size(t, superposition_max_size, superposition_schedule_beta)
+        collator.max_length = sequence_length * s
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                embeddings, all_topk_indices = model.headless_forward(
-                    input_ids,
-                    position_ids=position_ids,
-                    cu_seqlens=cu_seqlens,
-                    unpad_indices=unpad_indices,
-                    max_seqlen=max_seqlen,
-                )
-                classifier = model.get_classifier_weights()
-                loss_embeddings = embeddings.reshape(-1, embeddings.size(-1)).index_select(0, loss_indices)
-                loss = mcce_raw_token_mean_v2(
-                    loss_embeddings,
-                    classifier,
-                    labels,
-                    s,
-                    check_label_values=False,
-                )
-            phase = "tst"
-            batch_idx = step_idx
-        else:
-            batch, standard_iter = next_from_loader(train_loader, standard_iter)
+        if s == 1:
+            batch, train_iter = next_from_loader(train_loader, train_iter)
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             loss_mask = batch["loss_mask"].to(device)
@@ -534,59 +559,73 @@ def train(
                     attention_mask,
                     loss_mask=loss_mask,
                 )
-                loss = linear_cross_entropy(loss_embeddings, classifier, labels, ignore_index=-100)
-            phase = "recovery"
-            batch_idx = step_idx - superposition_steps
+                raw_loss = linear_cross_entropy(loss_embeddings, classifier, labels, ignore_index=-100)
+            entropy_floor = raw_loss.new_zeros(())
+            loss, loss_normalizer = ce_equivalent_reducible_loss(raw_loss, classifier.size(0), entropy_floor)
+            active_labels = labels.numel()
+        else:
+            tst_batch, train_iter = next_tst_batch(s, train_loader, train_iter)
+            if tst_batch is None:
+                # No TST batch available at this s. Skip step; do not advance the optimizer.
+                continue
+            input_ids = tst_batch["input_ids"].to(device)
+            attention_mask = tst_batch["attention_mask"].to(device)
+            position_ids = tst_batch["position_ids"].to(device)
+            cu_seqlens = tst_batch["cu_seqlens"].to(device)
+            unpad_indices = tst_batch["unpad_indices"].to(device)
+            max_seqlen = tst_batch["max_seqlen"]
+            loss_indices = tst_batch["loss_indices"].to(device)
+            labels = tst_batch["labels"].to(device)
+            s_tensor = tst_batch["s"].to(device)
 
-        if phase != current_phase and phase_steps > 0:
-            avg_phase_loss = phase_loss / phase_steps
-            print(f"Phase {current_phase}: {phase_steps} steps, Loss: {avg_phase_loss:.4f}")
-            logger.log(
-                {
-                    f"loss/{current_phase}_phase_loss": avg_phase_loss,
-                    f"training/{current_phase}_phase_steps": phase_steps,
-                },
-                step=global_step,
-                detailed_logging=True,
-            )
-            current_phase = phase
-            phase_loss = 0.0
-            phase_steps = 0
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                embeddings, all_topk_indices = model.headless_forward(
+                    input_ids,
+                    position_ids=position_ids,
+                    cu_seqlens=cu_seqlens,
+                    unpad_indices=unpad_indices,
+                    max_seqlen=max_seqlen,
+                )
+                classifier = model.get_classifier_weights()
+                loss_embeddings = embeddings.reshape(-1, embeddings.size(-1)).index_select(0, loss_indices)
+                raw_loss = mcce_raw_token_mean_v2(
+                    loss_embeddings,
+                    classifier,
+                    labels,
+                    s_tensor,
+                    check_label_values=False,
+                )
+            entropy_floor = bag_label_entropy_floor(labels, s_tensor)
+            loss, loss_normalizer = ce_equivalent_reducible_loss(raw_loss, classifier.size(0), entropy_floor)
+            active_labels = labels.numel()
 
         loss.backward()
         optimizer.step()
 
         loss_value = loss.item()
+        raw_loss_value = raw_loss.item()
+        entropy_floor_value = entropy_floor.item()
+        loss_normalizer_value = loss_normalizer.item()
         total_loss += loss_value
-        phase_loss += loss_value
-        phase_steps += 1
         auxillary_loss_free_update(model, all_topk_indices, update_rate, attention_mask)
 
         epoch = step_idx // max(1, len(train_loader))
-        metrics = logger.log_training_metrics(loss, optimizer, update_rate, global_step, epoch, batch_idx)
+        metrics = logger.log_training_metrics(loss, optimizer, update_rate, global_step, epoch, step_idx)
         metrics.update(logger.log_moe_metrics(all_topk_indices, global_step, attention_mask))
-        metrics["training/phase"] = 0 if phase == "tst" else 1
-        if phase == "tst":
-            metrics["token_superposition/active_labels"] = labels.numel()
+        metrics["loss/raw_batch_loss"] = raw_loss_value
+        metrics["loss/entropy_floor"] = entropy_floor_value
+        metrics["loss/reducible_gap"] = loss_normalizer_value
+        metrics["loss/reducible_raw_loss"] = raw_loss_value - entropy_floor_value
+        metrics["token_superposition/s"] = s
+        metrics["token_superposition/schedule_t"] = t
+        metrics["token_superposition/active_labels"] = active_labels
+        metrics[f"loss/s_{s}"] = loss_value
+        metrics[f"loss/raw_s_{s}"] = raw_loss_value
 
         detailed_logging = (global_step % logger.detailed_frequency == 0)
         logger.log(metrics, step=global_step, model=model, detailed_logging=detailed_logging)
 
         global_step += 1
-
-        if global_step == total_steps and phase_steps > 0:
-            avg_phase_loss = phase_loss / phase_steps
-            print(f"Phase {current_phase}: {phase_steps} steps, Loss: {avg_phase_loss:.4f}")
-            logger.log(
-                {
-                    f"loss/{current_phase}_phase_loss": avg_phase_loss,
-                    f"training/{current_phase}_phase_steps": phase_steps,
-                },
-                step=global_step,
-                detailed_logging=True,
-            )
-            phase_loss = 0.0
-            phase_steps = 0
 
         if checkpoint_interval_steps > 0 and global_step % checkpoint_interval_steps == 0:
             checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step}.safetensors"
@@ -628,9 +667,7 @@ def train(
 
 def main():
     config = ModelConfig()
-    data_max_length = config.sequence_length
-    if config.token_superposition_bag_size > 1 and config.token_superposition_ratio > 0.0:
-        data_max_length = config.sequence_length * config.token_superposition_bag_size
+    data_max_length = config.sequence_length * max(config.superposition_max_size, 1)
 
     train_dataset, tokenizer, _ = load_and_preprocess_data(max_length=data_max_length)
     config = ModelConfig(vocab_size=len(tokenizer))
@@ -644,8 +681,8 @@ def main():
         train_dataset,
         tokenizer,
         config.sequence_length,
-        superposition_bag_size=config.token_superposition_bag_size,
-        superposition_ratio=config.token_superposition_ratio,
+        superposition_max_size=config.superposition_max_size,
+        superposition_schedule_beta=config.superposition_schedule_beta,
     )
 
 if __name__ == "__main__":

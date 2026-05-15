@@ -30,13 +30,8 @@ class MoEModel(nn.Module):
 
     def _embed_tokens(self, x):
         if x.ndim == 3:
-            bag_size = x.shape[-1]
-            h = self.embedding(x[..., 0])
-            h_dtype = h.dtype
-            h = h.float()
-            for bag_idx in range(1, bag_size):
-                h = h + self.embedding(x[..., bag_idx]).float()
-            return (h / bag_size).to(h_dtype)
+            bag = self.embedding(x)
+            return bag.float().mean(dim=-2).to(bag.dtype)
 
         return self.embedding(x)
 

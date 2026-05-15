@@ -10,7 +10,7 @@ from modeling.model_config import ModelConfig
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_CHECKPOINT = ROOT / "checkpoints" / "checkpoint_epoch_1.safetensors"
+DEFAULT_CHECKPOINT = ROOT / "checkpoints" / "checkpoint_final.safetensors"
 DEFAULT_TOKENIZER = ROOT / "tokenizer.json"
 EOS_TOKEN = "<|endoftext|>"
 
@@ -46,7 +46,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
-    parser.add_argument("--prompt", default="She")
+    parser.add_argument("--prompt", default="Bang! And they turned, ")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     args = parser.parse_args()
 

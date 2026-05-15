@@ -86,12 +86,12 @@ if _TRITON_AVAILABLE:
     # Forward: fused single-pass kernel.
     # -------------------------------------------------------------------------
 
-    @triton.autotune(configs=_FWD_CONFIGS, key=["V", "D", "S_MAX"])
+    @triton.autotune(configs=_FWD_CONFIGS, key=["V", "D"])
     @triton.jit
     def _mcce_fwd_fused_kernel(
         H, E, LABELS, S, LSE, TARGET_SUM,
-        T,
-        V: tl.constexpr, D: tl.constexpr, S_MAX: tl.constexpr,
+        T, S_MAX,
+        V: tl.constexpr, D: tl.constexpr,
         BLOCK_T: tl.constexpr, BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr,
     ):
         # NOTE: we intentionally do NOT atomic_add into a shared scalar loss buffer
@@ -173,12 +173,12 @@ if _TRITON_AVAILABLE:
     # Backward: dH kernel. Grid (T/BT,). Each block fully owns DH[t_block, :].
     # -------------------------------------------------------------------------
 
-    @triton.autotune(configs=_BWD_CONFIGS, key=["V", "D", "S_MAX"], reset_to_zero=["DH"])
+    @triton.autotune(configs=_BWD_CONFIGS, key=["V", "D"], reset_to_zero=["DH"])
     @triton.jit
     def _mcce_bwd_dh_kernel(
         H, E, LABELS, S, LSE, TOTAL_RAW, GRAD_LOSS, DH,
-        T,
-        V: tl.constexpr, D: tl.constexpr, S_MAX: tl.constexpr,
+        T, S_MAX,
+        V: tl.constexpr, D: tl.constexpr,
         BLOCK_T: tl.constexpr, BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr,
     ):
         pid_t = tl.program_id(0)
@@ -253,12 +253,12 @@ if _TRITON_AVAILABLE:
     # Backward: dE kernel. Grid (V/BV,). Each block fully owns DE[v_block, :].
     # -------------------------------------------------------------------------
 
-    @triton.autotune(configs=_BWD_CONFIGS, key=["V", "D", "S_MAX"], reset_to_zero=["DE"])
+    @triton.autotune(configs=_BWD_CONFIGS, key=["V", "D"], reset_to_zero=["DE"])
     @triton.jit
     def _mcce_bwd_de_kernel(
         H, E, LABELS, S, LSE, TOTAL_RAW, GRAD_LOSS, DE,
-        T,
-        V: tl.constexpr, D: tl.constexpr, S_MAX: tl.constexpr,
+        T, S_MAX,
+        V: tl.constexpr, D: tl.constexpr,
         BLOCK_T: tl.constexpr, BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr,
     ):
         pid_v = tl.program_id(0)
@@ -345,7 +345,7 @@ class _MCCERawTokenMeanTritonV2(torch.autograd.Function):
         grid_fwd = lambda meta: (triton.cdiv(T, meta["BLOCK_T"]),)
         _mcce_fwd_fused_kernel[grid_fwd](
             hidden, embeddings, labels, s, lse, target_sum,
-            T, V, D, S_MAX,
+            T, S_MAX, V, D,
         )
 
         s_f = s.float()
@@ -369,13 +369,13 @@ class _MCCERawTokenMeanTritonV2(torch.autograd.Function):
             grid_dh = lambda meta: (triton.cdiv(T, meta["BLOCK_T"]),)
             _mcce_bwd_dh_kernel[grid_dh](
                 hidden, embeddings, labels, s, lse, total_raw, grad_loss, dhidden,
-                T, V, D, S_MAX,
+                T, S_MAX, V, D,
             )
         if need_e:
             grid_de = lambda meta: (triton.cdiv(V, meta["BLOCK_V"]),)
             _mcce_bwd_de_kernel[grid_de](
                 hidden, embeddings, labels, s, lse, total_raw, grad_loss, dembeddings,
-                T, V, D, S_MAX,
+                T, S_MAX, V, D,
             )
 
         return dhidden, dembeddings, None, None
