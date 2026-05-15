@@ -1,5 +1,19 @@
 from dataclasses import dataclass, field
 
+SUPERPOSITION_REFERENCE_SIZE = 1
+SUPERPOSITION_TRAINING_MAX_SIZE = 16
+SUPERPOSITION_SCHEDULE_BETA = 2.0
+
+
+def set_superposition(params, enabled=False):
+    """Configure Token Superposition Training or the s=1 reference path."""
+    params.superposition_max_size = (
+        SUPERPOSITION_TRAINING_MAX_SIZE if enabled else SUPERPOSITION_REFERENCE_SIZE
+    )
+    params.superposition_schedule_beta = SUPERPOSITION_SCHEDULE_BETA
+    return params
+
+
 @dataclass
 class ModelConfig:
     vocab_size: int = 8192
@@ -27,6 +41,7 @@ class ModelConfig:
     max_position_embeddings: int = 1024
     sequence_length: int = 256
     rope_theta: int = 100000
+    do_rope: bool = False
     initializer_range: float = 0.02
 
     # Token Superposition Training (TST). Per-step s is sampled from a
@@ -34,8 +49,8 @@ class ModelConfig:
     # Logits are beta * (1 - 2t) * log2(s); t = step / total_steps. At t=0 the
     # distribution favors max_size, at t=1 it favors 1. Set max_size=1 to
     # disable superposition entirely.
-    superposition_max_size: int = 16
-    superposition_schedule_beta: float = 2.0
+    superposition_max_size: int = SUPERPOSITION_TRAINING_MAX_SIZE
+    superposition_schedule_beta: float = SUPERPOSITION_SCHEDULE_BETA
 
     def __post_init__(self):
         self.n_routed_experts = self.n_experts - self.n_shared_experts

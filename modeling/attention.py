@@ -20,6 +20,7 @@ class GatedAttention(nn.Module):
         self.head_dim = config.hidden_size // config.n_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
+        self.do_rope = config.do_rope
         self.initializer_range = config.initializer_range
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
@@ -36,13 +37,16 @@ class GatedAttention(nn.Module):
         self.head_gate_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
         self.reset_parameters()
 
-        cos_cached, sin_cached = self._compute_rope_embeddings(
-            self.max_position_embeddings,
-            self.head_dim,
-            self.rope_theta,
-            dtype=torch.float32,
-            device=self.q_proj.weight.device,
-        )
+        if self.do_rope:
+            cos_cached, sin_cached = self._compute_rope_embeddings(
+                self.max_position_embeddings,
+                self.head_dim,
+                self.rope_theta,
+                dtype=torch.float32,
+                device=self.q_proj.weight.device,
+            )
+        else:
+            cos_cached, sin_cached = None, None
         self.register_buffer("cos_cached", cos_cached, persistent=False)
         self.register_buffer("sin_cached", sin_cached, persistent=False)
 
@@ -137,7 +141,7 @@ class GatedAttention(nn.Module):
         # In B S (H D)
         bsz, seq_len, _ = hidden_states.size()
 
-        if position_ids is None:
+        if self.do_rope and position_ids is None:
             position_ids = torch.arange(seq_len, device=hidden_states.device)
             position_ids = repeat(position_ids, 'l -> b l', b=bsz)
 
@@ -149,17 +153,18 @@ class GatedAttention(nn.Module):
         key_states = rearrange(key_states, "b s (h d) -> b s h d", h=self.num_key_value_heads, d=self.head_dim)
         value_states = rearrange(value_states, "b s (h d) -> b s h d", h=self.num_key_value_heads, d=self.head_dim)
 
-        # Slice off position specific rope freqs from the cached freqs
-        cos = self.cos_cached[:, position_ids]  # [1, bsz, seq_len, dim]
-        sin = self.sin_cached[:, position_ids]  # [1, bsz, seq_len, dim]
+        if self.do_rope:
+            # Slice off position specific rope freqs from the cached freqs.
+            cos = self.cos_cached[:, position_ids]  # [1, bsz, seq_len, dim]
+            sin = self.sin_cached[:, position_ids]  # [1, bsz, seq_len, dim]
 
-        query_states, key_states = LigerRopeFunction.apply(
-            query_states,
-            key_states,
-            cos.squeeze(0),
-            sin.squeeze(0),
-            position_ids
-        )
+            query_states, key_states = LigerRopeFunction.apply(
+                query_states,
+                key_states,
+                cos.squeeze(0),
+                sin.squeeze(0),
+                position_ids
+            )
 
         attn_output = self._flash_attention_varlen(
             query_states,

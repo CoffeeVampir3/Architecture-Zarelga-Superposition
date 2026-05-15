@@ -114,6 +114,7 @@ class HeavilyCompressedAttention(nn.Module):
         self.block_size = config.hca_block_size
         self.window_size = config.hca_window_size
         self.rope_theta = config.rope_theta
+        self.do_rope = config.do_rope
         self.max_position_embeddings = config.max_position_embeddings
         self.initializer_range = config.initializer_range
 
@@ -142,13 +143,16 @@ class HeavilyCompressedAttention(nn.Module):
         nn.init.normal_(self.o_proj.weight, mean=0.0, std=self.initializer_range)
         nn.init.normal_(self.k_sink, mean=0.0, std=self.initializer_range)
 
-        cos_cached, sin_cached = self._compute_rope_embeddings(
-            self.max_position_embeddings,
-            self.head_dim,
-            self.rope_theta,
-            dtype=torch.float32,
-            device=self.q_proj.weight.device,
-        )
+        if self.do_rope:
+            cos_cached, sin_cached = self._compute_rope_embeddings(
+                self.max_position_embeddings,
+                self.head_dim,
+                self.rope_theta,
+                dtype=torch.float32,
+                device=self.q_proj.weight.device,
+            )
+        else:
+            cos_cached, sin_cached = None, None
         self.register_buffer("cos_cached", cos_cached, persistent=False)
         self.register_buffer("sin_cached", sin_cached, persistent=False)
 
@@ -172,6 +176,9 @@ class HeavilyCompressedAttention(nn.Module):
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> torch.Tensor:
         """Apply HuggingFace-style RoPE. x: [B, N, H, D], position_ids: [B, N]."""
+        if not self.do_rope:
+            return x
+
         cos = self.cos_cached[position_ids]  # [B, N, D]
         sin = self.sin_cached[position_ids]
         cos = cos.unsqueeze(2).to(x.dtype)  # [B, N, 1, D]

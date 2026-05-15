@@ -14,7 +14,12 @@ from pathlib import Path
 from utils.trainutils import AimLogger, count_parameters_layerwise, save_checkpoint
 from utils.tokenizer import load_tokenizer
 from modeling.model import MoEModel
-from modeling.model_config import ModelConfig
+from modeling.model_config import (
+    ModelConfig,
+    SUPERPOSITION_REFERENCE_SIZE,
+    SUPERPOSITION_SCHEDULE_BETA,
+    set_superposition,
+)
 from cut_cross_entropy import linear_cross_entropy
 from modeling.mcce_fast_v2 import mcce_raw_token_mean_v2
 
@@ -437,8 +442,8 @@ def train(
     update_rate=1e-5,
     checkpoint_interval_steps=10_000,
     max_rolling_checkpoints=5,
-    superposition_max_size=16,
-    superposition_schedule_beta=2.0,
+    superposition_max_size=SUPERPOSITION_REFERENCE_SIZE,
+    superposition_schedule_beta=SUPERPOSITION_SCHEDULE_BETA,
 ):
     device = torch.device("cuda")
     model.to(device)
@@ -492,6 +497,7 @@ def train(
         'train_examples': len(train_dataset),
         'checkpoint_interval_steps': checkpoint_interval_steps,
         'max_rolling_checkpoints': max_rolling_checkpoints,
+        'attention/do_rope': model.config.do_rope,
         'token_superposition/enabled': superposition_enabled,
         'token_superposition/max_size': superposition_max_size,
         'token_superposition/schedule_beta': superposition_schedule_beta,
@@ -666,11 +672,11 @@ def train(
     logger.close()
 
 def main():
-    config = ModelConfig()
+    config = set_superposition(ModelConfig(), enabled=False)
     data_max_length = config.sequence_length * max(config.superposition_max_size, 1)
 
     train_dataset, tokenizer, _ = load_and_preprocess_data(max_length=data_max_length)
-    config = ModelConfig(vocab_size=len(tokenizer))
+    config = set_superposition(ModelConfig(vocab_size=len(tokenizer)), enabled=False)
 
     model = MoEModel(config)
 
