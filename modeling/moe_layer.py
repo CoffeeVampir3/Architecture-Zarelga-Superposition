@@ -25,6 +25,15 @@ class MoELayer(nn.Module):
             top_k=config.n_experts_per_token,
             activation=nn.SiLU(),
         )
+        # scattermoe's GLUMLP hardcodes a std=0.02 init; re-init at the config's
+        # 1/sqrt(d) so the routed-expert stacks match the paper's init (and so their
+        # frozen MuonMD sphere radii are correct).
+        self.reset_routed_expert_parameters()
+
+    def reset_routed_expert_parameters(self):
+        std = self.config.initializer_range
+        nn.init.normal_(self.routed_experts.experts.weight, mean=0.0, std=std)
+        nn.init.normal_(self.routed_experts.output_experts.weight, mean=0.0, std=std)
 
     def forward(self, hidden_states, unpad_indices=None):
         if unpad_indices is not None:

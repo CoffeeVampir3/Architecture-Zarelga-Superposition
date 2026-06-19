@@ -5,7 +5,6 @@ import torch.nn.functional as F
 
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
 import math
-import random
 import time
 import json
 from torch.utils.data import DataLoader, Dataset
@@ -14,11 +13,10 @@ from pathlib import Path
 from utils.trainutils import AimLogger, count_parameters_layerwise, save_checkpoint
 from utils.tokenizer import load_tokenizer
 from modeling.model import MoEModel
+from optimizer.muon import SingleDeviceMuonMDWithAuxAdam
 from modeling.model_config import (
     ModelConfig,
     SUPERPOSITION_REFERENCE_SIZE,
-    SUPERPOSITION_SCHEDULE_BETA,
-    set_superposition,
 )
 from cut_cross_entropy import linear_cross_entropy
 from modeling.mcce_fast_v2 import mcce_raw_token_mean_v2
@@ -222,33 +220,19 @@ def bucket_max_seqlen(max_seqlen, max_length):
         return 0
     return min(((max_seqlen + 31) // 32) * 32, max_length)
 
-def sample_superposition_size(t: float, max_size: int, beta: float) -> int:
-    """Sample s ∈ {1, 2, 4, ..., effective_max} from a schedule-dependent categorical.
+def sample_superposition_size(t: float, max_size: int) -> int:
+    """Pick a packing group size s from a simple two-phase schedule.
 
-    Two schedules compose:
-      1. Bucket ejection: every 20% of training, drop the currently-largest
-         bucket from the support. So at t ∈ [0, 0.2) the support is the full
-         {1, 2, …, max_size}; at t ∈ [0.2, 0.4) the top is removed; etc. Once
-         the support collapses to {1}, s=1 is forced.
-      2. Within the remaining support, sample with logits β · (1 − 2t) · log2(s).
-         At t=0 large s is favored, at t=0.5 the distribution over remaining
-         buckets is uniform, at t=1 small s is favored.
+      - t ∈ [0.0, 0.4): s = 8 (token grouping in groups of 8)
+      - t ∈ [0.4, 1.0]: s = 1 (normal raw-token training)
+
+    s is clamped to max_size; when max_size <= 1 (TST disabled) s is always 1.
     """
     if max_size <= 1:
         return 1
-    log2_max = int(math.log2(max_size))
-    drops = min(int(t / 0.2), log2_max)
-    effective_log2_max = log2_max - drops
-    if effective_log2_max <= 0:
-        return 1
-    sizes = [1 << k for k in range(effective_log2_max + 1)]
-    coef = beta * (1.0 - 2.0 * t)
-    logits = [coef * k for k in range(effective_log2_max + 1)]
-    m = max(logits)
-    exps = [math.exp(l - m) for l in logits]
-    z = sum(exps)
-    weights = [e / z for e in exps]
-    return random.choices(sizes, weights=weights, k=1)[0]
+    if t < 0.4:
+        return min(8, max_size)
+    return 1
 
 
 def build_token_superposition_batch(batch, superposition_bag_size, latent_sequence_length, pad_token_id):
@@ -362,53 +346,150 @@ def build_token_superposition_batch(batch, superposition_bag_size, latent_sequen
         "s": s,
     }
 
-def build_weight_decay_optm(model, learning_rate, weight_decay=0.01, betas=(0.9, 0.95)):
-    zero_centered_rmsnorm_params = []
-    decay_params = []
-    no_decay_params = []
+def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
+                           momentum=0.95, gain_lr=1e-3,
+                           adam_betas=(0.9, 0.95), adam_eps=1e-16):
+    """Split params into a Muon (Magnitude-Direction) group and an aux-Adam group,
+    and build a capturable single-device MuonMD optimizer.
 
+    Muon group (Frobenius sphere): attention q/k/v/o and head gate, the shared-expert
+    MLPs, and the 3-D routed-expert stacks (E, out, in) (handled as E independent
+    per-expert matrices). No weight decay (directions live on a fixed-norm sphere).
+    Router group (row sphere): the MoE router gate, normalized along the expert axis
+    (each expert's gating row on its own sphere), with the standard Muon shape factor
+    max(1, sqrt(dout/din)) so the wide router matrix isn't scaled away from `lr` --
+    per the paper's MoE recipe.
+    Adam group: the tied input/output embedding and all 1-D params (ZeroCenteredRMSNorm
+    gains, the final norm, any biases).
+
+    Learning rates are 0-dim CUDA tensors so a CUDA-graph-captured step() reads the
+    scheduler's in-place updates on every replay. capturable=True keeps the Adam step
+    counters on-device so bias correction stays correct across graph replays.
+    """
+    muon_params, router_params, adam_params = [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-
-        module = model.get_submodule('.'.join(name.split('.')[:-1]))
-
-        if isinstance(module, ZeroCenteredRMSNorm):
-            zero_centered_rmsnorm_params.append(param)
-        elif any(exclude in name for exclude in [
-            'bias', 'embedding', 'output_layer', 'norm.weight'
-        ]):
-            no_decay_params.append(param)
+        is_embedding = ('embedding' in name) or ('output_layer' in name)
+        # The MoE router gate lives at `layers.*.mlp.gate.weight`; normalize it along
+        # the expert axis (rows). The attention head gate (`...head_gate_proj.weight`)
+        # and the shared-expert gate (`...shared_experts.gate_proj.weight`) do NOT match.
+        is_router = ('mlp.gate.weight' in name)
+        if param.ndim >= 2 and not is_embedding:
+            (router_params if is_router else muon_params).append(param)
         else:
-            decay_params.append(param)
+            adam_params.append(param)
 
-    return torch.optim.AdamW([
-        {'params': zero_centered_rmsnorm_params, 'weight_decay': 1e-4},
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': no_decay_params, 'weight_decay': 0.0}
-    ], lr=learning_rate, betas=betas, eps=1e-16)
+    muon_lr_tensor = torch.tensor(float(muon_lr), device=device)
+    router_lr_tensor = torch.tensor(float(muon_lr), device=device)
+    adam_lr_tensor = torch.tensor(float(adam_lr), device=device)
+
+    param_groups = [
+        dict(params=muon_params, use_muon=True, lr=muon_lr_tensor,
+             momentum=momentum, gain_lr=gain_lr, capturable=True),
+    ]
+    if router_params:
+        param_groups.append(
+            dict(params=router_params, use_muon=True, lr=router_lr_tensor,
+                 momentum=momentum, gain_lr=gain_lr, norm_axis="row",
+                 rescale_mode="muon", capturable=True),
+        )
+    param_groups.append(
+        dict(params=adam_params, use_muon=False, lr=adam_lr_tensor,
+             betas=adam_betas, eps=adam_eps, weight_decay=0.0, capturable=True),
+    )
+    return SingleDeviceMuonMDWithAuxAdam(param_groups)
+
+def _lr_scalar(value):
+    return value.item() if torch.is_tensor(value) else value
+
 
 class CosineWarmupScheduler:
-    def __init__(self, optimizer, warmup_steps, total_steps, peak_lr, min_lr_ratio=0.1):
+    """Cosine decay with linear warmup. Each param group's LR is written into its
+    0-dim LR tensor IN PLACE (.fill_), so a CUDA-graph-captured optimizer step reads
+    the new value on every replay. (Re-binding the tensor would leave the captured
+    graph pointing at a stale buffer -- the schedule would freeze at the captured
+    value.)
+
+    Each group keeps its own peak LR (read from its LR tensor at construction) and is
+    scaled by the same warmup/cosine fraction, so the Muon and Adam groups can run at
+    very different magnitudes while sharing one schedule shape.
+    """
+    def __init__(self, optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
         self.optimizer = optimizer
         self.total_steps = max(1, total_steps)
         self.warmup_steps = min(max(1, warmup_steps), self.total_steps)
-        self.peak_lr = peak_lr
-        self.min_lr = peak_lr * min_lr_ratio
+        self.min_lr_ratio = min_lr_ratio
+        self.base_lrs = [_lr_scalar(pg['lr']) for pg in optimizer.param_groups]
         self.step_count = 0
+        # Kept for checkpoint serialization (save_checkpoint reads these).
+        self.peak_lr = self.base_lrs[0]
+        self.min_lr = self.peak_lr * min_lr_ratio
 
-    def step(self):
-        self.step_count += 1
+    def _fraction(self):
         if self.step_count <= self.warmup_steps:
-            lr = self.peak_lr * (self.step_count / self.warmup_steps)
-        else:
-            progress = (self.step_count - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
-            progress = min(1.0, progress)
-            lr = self.min_lr + 0.5 * (self.peak_lr - self.min_lr) * (1 + math.cos(math.pi * progress))
+            return self.step_count / self.warmup_steps
+        progress = (self.step_count - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+        progress = min(1.0, progress)
+        return self.min_lr_ratio + 0.5 * (1 - self.min_lr_ratio) * (1 + math.cos(math.pi * progress))
 
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-        return lr
+    def step(self, increment=1):
+        self.step_count += increment
+        fraction = self._fraction()
+        for base_lr, param_group in zip(self.base_lrs, self.optimizer.param_groups):
+            lr = base_lr * fraction
+            lr_ref = param_group['lr']
+            if torch.is_tensor(lr_ref):
+                lr_ref.fill_(lr)
+            else:
+                param_group['lr'] = lr
+        return self.base_lrs[0] * fraction
+
+class LinearDecayScheduler:
+    """Warmup-free linear LR decay -- the paper's dense recipe (Hägele et al. 2026):
+    'dense models use a linear LR decay to 1e-8 for all groups', and MD decoupling
+    removes the need for warmup (the large early updates it exists to tame never
+    appear on the sphere, and dropping warmup even improves the loss).
+
+    Shares the in-place 0-dim LR tensor update of CosineWarmupScheduler so a
+    CUDA-graph-captured optimizer step reads the new LR on every replay. Each param
+    group keeps its own peak LR and is scaled by the same fraction; the gains' LR is
+    a separate group key and is intentionally left unscaled (held at the Adam value).
+
+    warmup_steps defaults to 0 (warmup-free); a small linear warmup can be restored by
+    passing warmup_steps > 0. min_lr_ratio is the floor as a fraction of each group's
+    peak (0.0 == decay to ~0, matching the paper's 1e-8 endpoint).
+    """
+    def __init__(self, optimizer, total_steps, warmup_steps=0, min_lr_ratio=0.0):
+        self.optimizer = optimizer
+        self.total_steps = max(1, total_steps)
+        self.warmup_steps = min(max(0, warmup_steps), self.total_steps)
+        self.min_lr_ratio = min_lr_ratio
+        self.base_lrs = [_lr_scalar(pg['lr']) for pg in optimizer.param_groups]
+        self.step_count = 0
+        # Kept for checkpoint serialization (save_checkpoint reads these).
+        self.peak_lr = self.base_lrs[0]
+        self.min_lr = self.peak_lr * min_lr_ratio
+
+    def _fraction(self):
+        if self.warmup_steps > 0 and self.step_count < self.warmup_steps:
+            return self.step_count / self.warmup_steps
+        progress = (self.step_count - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+        progress = min(1.0, max(0.0, progress))
+        return 1.0 - (1.0 - self.min_lr_ratio) * progress
+
+    def step(self, increment=1):
+        self.step_count += increment
+        fraction = self._fraction()
+        for base_lr, param_group in zip(self.base_lrs, self.optimizer.param_groups):
+            lr = base_lr * fraction
+            lr_ref = param_group['lr']
+            if torch.is_tensor(lr_ref):
+                lr_ref.fill_(lr)
+            else:
+                param_group['lr'] = lr
+        return self.base_lrs[0] * fraction
+
 
 def _checkpoint_trainer_state_path(checkpoint_path):
     return checkpoint_path.with_suffix(".trainer.pt")
@@ -437,20 +518,26 @@ def train(
     tokenizer,
     sequence_length,
     num_epochs=1,
-    batch_size=32,
-    learning_rate=1e-4,
+    batch_size=16,
+    muon_lr=0.02,
+    adam_lr=3e-4,
     update_rate=1e-5,
     checkpoint_interval_steps=10_000,
     max_rolling_checkpoints=5,
     superposition_max_size=SUPERPOSITION_REFERENCE_SIZE,
-    superposition_schedule_beta=SUPERPOSITION_SCHEDULE_BETA,
 ):
     device = torch.device("cuda")
     model.to(device)
 
-    weight_decay = 0.01
-    optimizer_betas = (0.9, 0.95)
-    optimizer = build_weight_decay_optm(model, learning_rate, weight_decay=weight_decay, betas=optimizer_betas)
+    muon_momentum = 0.95
+    gain_lr = 1e-3
+    adam_betas = (0.9, 0.95)
+    adam_eps = 1e-16
+    optimizer = build_muonmd_optimizer(
+        model, device, muon_lr=muon_lr, adam_lr=adam_lr,
+        momentum=muon_momentum, gain_lr=gain_lr,
+        adam_betas=adam_betas, adam_eps=adam_eps,
+    )
 
     superposition_enabled = superposition_max_size > 1
     superposition_raw_length = sequence_length * max(superposition_max_size, 1)
@@ -463,7 +550,7 @@ def train(
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        collate_fn=collator,
+        collate_fn=lambda xs: xs,
     )
 
     checkpoint_dir = Path("checkpoints")
@@ -474,34 +561,42 @@ def train(
     global_step = 0
 
     total_steps = len(train_loader) * num_epochs
-    warmup_steps = min(500, max(1, total_steps // 20))
-    scheduler = CosineWarmupScheduler(
+    # Paper recipe: warmup-free linear decay to ~0 (their 1e-8 endpoint) for all
+    # groups. MD decoupling makes warmup unnecessary on the sphere.
+    warmup_steps = 0
+    scheduler = LinearDecayScheduler(
         optimizer,
-        warmup_steps=warmup_steps,
         total_steps=total_steps,
-        peak_lr=learning_rate,
-        min_lr_ratio=0.1,
+        warmup_steps=warmup_steps,
+        min_lr_ratio=0.0,
     )
     logger.log_params({
         'batch_size': batch_size,
-        'learning_rate': learning_rate,
+        'muon_lr': muon_lr,
+        'adam_lr': adam_lr,
         'num_epochs': num_epochs,
         'sequence_length': sequence_length,
         'update_rate': update_rate,
-        'optimizer': 'AdamW',
-        'optimizer_betas': optimizer_betas,
-        'optimizer_eps': 1e-16,
-        'weight_decay': weight_decay,
+        'optimizer': 'SingleDeviceMuonMDWithAuxAdam (capturable / CUDA-graph)',
+        'optimizer_momentum': muon_momentum,
+        'optimizer_gain_lr': gain_lr,
+        'adam_betas': adam_betas,
+        'adam_eps': adam_eps,
+        'weight_decay': 0.0,
+        'lr_schedule': 'linear_decay_warmup_free',
         'warmup_steps': warmup_steps,
-        'min_lr': learning_rate * 0.1,
+        'min_lr': muon_lr * scheduler.min_lr_ratio,
         'train_examples': len(train_dataset),
         'checkpoint_interval_steps': checkpoint_interval_steps,
         'max_rolling_checkpoints': max_rolling_checkpoints,
         'attention/do_rope': model.config.do_rope,
+        'attention/pos_rope_dims': model.config.pos_rope_dims,
+        'attention/s_rope_dims': model.config.s_rope_dims,
         'token_superposition/enabled': superposition_enabled,
         'token_superposition/max_size': superposition_max_size,
-        'token_superposition/schedule_beta': superposition_schedule_beta,
         'token_superposition/max_raw_sequence_length': superposition_raw_length,
+        'loss/mcce_enabled': superposition_enabled,
+        'loss/backend': 'mcce_raw_token_mean_v2' if superposition_enabled else 'linear_cross_entropy',
         'loss/normalization': 'ce_equivalent_reducible_loss',
     })
 
@@ -512,11 +607,20 @@ def train(
             iterator = iter(loader)
             return next(iterator), iterator
 
+    def fetch_records(s_value, loader, iterator):
+        records = []
+        for _ in range(s_value):
+            batch_records, iterator = next_from_loader(loader, iterator)
+            records.extend(batch_records)
+        return records, iterator
+
     def next_tst_batch(s_value, loader, iterator):
-        # Try up to len(loader) raw batches before giving up; some raw batches
-        # may have no segment long enough to produce a TST batch at this s.
-        for _ in range(max(1, len(loader))):
-            raw_batch, iterator = next_from_loader(loader, iterator)
+        # Each retry consumes s_value loader batches; cap retries so a failure
+        # to build a TST batch can't burn more than ~one dataset pass.
+        max_retries = max(1, len(loader) // max(1, s_value))
+        for _ in range(max_retries):
+            records, iterator = fetch_records(s_value, loader, iterator)
+            raw_batch = collator(records)
             tst_batch = build_token_superposition_batch(
                 raw_batch,
                 s_value,
@@ -532,16 +636,29 @@ def train(
     train_start_time = time.time()
     train_iter = iter(train_loader)
 
-    for step_idx in tqdm(range(total_steps)):
-        optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
+    step_idx = 0
+    optimizer_step_count = 0
+    last_checkpoint_step = 0
+    # CUDA-graph capture of the optimizer step: run a few eager steps first to
+    # initialise optimizer state (momentum buffers, gains, on-device step counters)
+    # and warm cuBLAS for the Newton-Schulz matmuls, then capture step() once and
+    # replay it every subsequent step.
+    opt_graph = None
+    capture_warmup_steps = 5
+    pbar = tqdm(total=total_steps)
+    while step_idx < total_steps:
+        # set_to_none=False keeps grad buffers at stable addresses across iterations,
+        # which the captured optimizer-step graph reads from on every replay.
+        optimizer.zero_grad(set_to_none=False)
 
         t = step_idx / max(1, total_steps - 1)
-        s = sample_superposition_size(t, superposition_max_size, superposition_schedule_beta)
+        s = sample_superposition_size(t, superposition_max_size)
         collator.max_length = sequence_length * s
+        scheduler.step(increment=s)
 
         if s == 1:
-            batch, train_iter = next_from_loader(train_loader, train_iter)
+            records, train_iter = fetch_records(1, train_loader, train_iter)
+            batch = collator(records)
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             loss_mask = batch["loss_mask"].to(device)
@@ -573,7 +690,10 @@ def train(
         else:
             tst_batch, train_iter = next_tst_batch(s, train_loader, train_iter)
             if tst_batch is None:
-                # No TST batch available at this s. Skip step; do not advance the optimizer.
+                # next_tst_batch already consumed loader batches in its retries;
+                # advance step_idx so the budget loop can't get stuck.
+                step_idx += s
+                pbar.update(s)
                 continue
             input_ids = tst_batch["input_ids"].to(device)
             attention_mask = tst_batch["attention_mask"].to(device)
@@ -608,53 +728,103 @@ def train(
             active_labels = labels.numel()
 
         loss.backward()
-        optimizer.step()
+
+        # Capture-once / replay-many optimizer step. The step only reads parameters
+        # and their fixed-shape grads, so it is CUDA-graph-safe even though the forward
+        # is dynamic. CUDA-graph capture records but does not execute, so replay
+        # immediately to apply this step's update. The TST skip path above `continue`s
+        # before reaching here, so a skipped batch never triggers a replay.
+        if opt_graph is not None:
+            opt_graph.replay()
+        elif optimizer_step_count >= capture_warmup_steps:
+            torch.cuda.synchronize()
+            opt_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(opt_graph):
+                optimizer.step()
+            opt_graph.replay()
+        else:
+            optimizer.step()
 
         loss_value = loss.item()
-        raw_loss_value = raw_loss.item()
         entropy_floor_value = entropy_floor.item()
         loss_normalizer_value = loss_normalizer.item()
         total_loss += loss_value
         auxillary_loss_free_update(model, all_topk_indices, update_rate, attention_mask)
 
+        step_idx += s
+        optimizer_step_count += 1
+        global_step = step_idx
+        pbar.update(s)
+
+        # --- memory / shape instrumentation (OOM debugging) ---
+        # num_rows is the (variable) packed batch dimension; if it swings step to
+        # step and reserved_gb climbs while allocated_gb stays flat, the OOM is
+        # allocator fragmentation from non-stationary shapes, not a true leak.
+        num_rows = int(input_ids.shape[0])
+        num_valid_tokens = int(attention_mask.sum().item())
+        mem_alloc_gb = torch.cuda.memory_allocated() / 1e9
+        mem_reserved_gb = torch.cuda.memory_reserved() / 1e9
+        mem_max_alloc_gb = torch.cuda.max_memory_allocated() / 1e9
+        frag_gb = mem_reserved_gb - mem_alloc_gb
+        pbar.set_postfix(
+            rows=num_rows,
+            tok=num_valid_tokens,
+            alloc=f"{mem_alloc_gb:.2f}",
+            resv=f"{mem_reserved_gb:.2f}",
+            frag=f"{frag_gb:.2f}",
+        )
+        # Persisted console line (tqdm.write prints above the bar without clobbering
+        # it) so the rows/tokens/memory trend up to an OOM survives in scrollback.
+        tqdm.write(
+            f"[mem] step={step_idx} s={s} rows={num_rows} tok={num_valid_tokens} "
+            f"alloc={mem_alloc_gb:.2f}GB resv={mem_reserved_gb:.2f}GB "
+            f"frag={frag_gb:.2f}GB max_alloc={mem_max_alloc_gb:.2f}GB"
+        )
+
         epoch = step_idx // max(1, len(train_loader))
         metrics = logger.log_training_metrics(loss, optimizer, update_rate, global_step, epoch, step_idx)
         metrics.update(logger.log_moe_metrics(all_topk_indices, global_step, attention_mask))
-        metrics["loss/raw_batch_loss"] = raw_loss_value
         metrics["loss/entropy_floor"] = entropy_floor_value
         metrics["loss/reducible_gap"] = loss_normalizer_value
-        metrics["loss/reducible_raw_loss"] = raw_loss_value - entropy_floor_value
         metrics["token_superposition/s"] = s
         metrics["token_superposition/schedule_t"] = t
         metrics["token_superposition/active_labels"] = active_labels
+        metrics["training/optimizer_steps"] = optimizer_step_count
         metrics[f"loss/s_{s}"] = loss_value
-        metrics[f"loss/raw_s_{s}"] = raw_loss_value
+        metrics["mem/num_rows"] = num_rows
+        metrics["mem/num_valid_tokens"] = num_valid_tokens
+        metrics["mem/allocated_gb"] = mem_alloc_gb
+        metrics["mem/reserved_gb"] = mem_reserved_gb
+        metrics["mem/max_allocated_gb"] = mem_max_alloc_gb
+        metrics["mem/fragmentation_gb"] = frag_gb
 
-        detailed_logging = (global_step % logger.detailed_frequency == 0)
+        detailed_logging = (optimizer_step_count % logger.detailed_frequency == 0)
         logger.log(metrics, step=global_step, model=model, detailed_logging=detailed_logging)
 
-        global_step += 1
-
-        if checkpoint_interval_steps > 0 and global_step % checkpoint_interval_steps == 0:
-            checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step}.safetensors"
+        if checkpoint_interval_steps > 0 and (
+            step_idx // checkpoint_interval_steps > last_checkpoint_step // checkpoint_interval_steps
+        ):
+            last_checkpoint_step = step_idx
+            checkpoint_path = checkpoint_dir / f"checkpoint_step_{step_idx}.safetensors"
             save_checkpoint(
                 model,
                 optimizer,
                 str(checkpoint_path),
                 scheduler=scheduler,
-                global_step=global_step,
+                global_step=step_idx,
                 epoch=epoch + 1,
             )
             prune_rolling_checkpoints(checkpoint_dir, max_rolling_checkpoints)
             print(f"Checkpoint saved: {checkpoint_path}")
 
-    avg_loss = total_loss / max(1, total_steps)
+    avg_loss = total_loss / max(1, optimizer_step_count)
     train_time = time.time() - train_start_time
     logger.log(
         {
             'loss/train_loss': avg_loss,
             'training/train_time': train_time,
             'training/total_steps': total_steps,
+            'training/optimizer_steps': optimizer_step_count,
         },
         step=global_step,
         detailed_logging=True,
@@ -674,11 +844,19 @@ def train(
     logger.close()
 
 def main():
-    config = set_superposition(ModelConfig(), enabled=True)
-    data_max_length = config.sequence_length * max(config.superposition_max_size, 1)
+    # Token grouping (Token Superposition Training) enabled: groups of 8 for the
+    # first 40% of training, then s=1 (normal raw-token training) for the
+    # remaining 60%. S-RoPE on. See sample_superposition_size for the schedule.
+    superposition_enabled = True
+
+    bootstrap_config = ModelConfig(superposition_enabled=superposition_enabled)
+    data_max_length = bootstrap_config.sequence_length * bootstrap_config.superposition_max_size
 
     train_dataset, tokenizer, _ = load_and_preprocess_data(max_length=data_max_length)
-    config = set_superposition(ModelConfig(vocab_size=len(tokenizer)), enabled=True)
+    config = ModelConfig(
+        vocab_size=len(tokenizer),
+        superposition_enabled=superposition_enabled,
+    )
 
     model = MoEModel(config)
 
@@ -690,7 +868,6 @@ def main():
         tokenizer,
         config.sequence_length,
         superposition_max_size=config.superposition_max_size,
-        superposition_schedule_beta=config.superposition_schedule_beta,
     )
 
 if __name__ == "__main__":

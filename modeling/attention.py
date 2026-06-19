@@ -8,6 +8,7 @@ from einops import rearrange, repeat
 
 from .liger_rope import LigerRopeFunction
 from .model_config import ModelConfig
+from .zRMSNorm import ZeroCenteredRMSNorm
 
 
 # https://arxiv.org/abs/2505.06708
@@ -36,6 +37,18 @@ class GatedAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
         self.head_gate_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+
+        # QK-norm: per-head RMSNorm over head_dim, applied to Q and K before RoPE.
+        # Gain init == 1 (ZeroCenteredRMSNorm stores 1 + w with w init 0), so it is
+        # identity at init; the gains are 1-D and train under Adam.
+        self.use_qk_norm = config.use_qk_norm
+        if self.use_qk_norm:
+            self.q_norm = ZeroCenteredRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = ZeroCenteredRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+
         self.reset_parameters()
 
         # Three-band rotation partition over head_dim:
@@ -209,6 +222,10 @@ class GatedAttention(nn.Module):
         query_states = rearrange(query_states, "b s (h d) -> b s h d", h=self.num_heads, d=self.head_dim)
         key_states = rearrange(key_states, "b s (h d) -> b s h d", h=self.num_key_value_heads, d=self.head_dim)
         value_states = rearrange(value_states, "b s (h d) -> b s h d", h=self.num_key_value_heads, d=self.head_dim)
+
+        # QK-norm over head_dim (per head), before RoPE.
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
 
         if self.do_rope:
             # Pos band: same cos/sin for Q and K (symmetric rotation).

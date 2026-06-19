@@ -32,10 +32,14 @@ def _trainer_state_path(filename):
     return Path(filename).with_suffix(".trainer.pt")
 
 def save_checkpoint(model, optimizer, filename="checkpoint.safetensors", scheduler=None, global_step=None, epoch=None):
-    if hasattr(model, '_orig_mod'):
-        model_state = model._orig_mod.state_dict()
-    else:
-        model_state = model.state_dict()
+    base = model._orig_mod if hasattr(model, '_orig_mod') else model
+    model_state = base.state_dict()
+
+    # When the classifier is tied to the embedding, the two state-dict entries
+    # share storage; safetensors refuses shared tensors. Drop the duplicate and
+    # re-tie on load.
+    if getattr(base, 'tie_word_embeddings', False):
+        model_state.pop('output_layer.weight', None)
 
     save_file(model_state, filename)
 
@@ -58,10 +62,11 @@ def save_checkpoint(model, optimizer, filename="checkpoint.safetensors", schedul
 def load_checkpoint(model, optimizer, filename="checkpoint.safetensors", scheduler=None):
     model_state = load_file(filename)
 
-    if hasattr(model, '_orig_mod'):
-        model._orig_mod.load_state_dict(model_state)
-    else:
-        model.load_state_dict(model_state)
+    base = model._orig_mod if hasattr(model, '_orig_mod') else model
+    tied = getattr(base, 'tie_word_embeddings', False)
+    base.load_state_dict(model_state, strict=not tied)
+    if tied:
+        base.tie_weights()
 
     trainer_path = _trainer_state_path(filename)
     if not trainer_path.exists():

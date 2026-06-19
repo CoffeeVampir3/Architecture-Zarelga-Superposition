@@ -21,19 +21,38 @@ class MoEModel(nn.Module):
 
         self.norm = ZeroCenteredRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.output_layer = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.tie_word_embeddings = config.tie_word_embeddings
 
         self.reset_parameters()
+        if self.tie_word_embeddings:
+            self.tie_weights()
 
     def reset_parameters(self):
         nn.init.normal_(self.embedding.weight, mean=0.0, std=self.config.initializer_range)
-        nn.init.normal_(self.output_layer.weight, mean=0.0, std=self.config.initializer_range)
+        if not self.config.tie_word_embeddings:
+            nn.init.normal_(self.output_layer.weight, mean=0.0, std=self.config.initializer_range)
+
+    def tie_weights(self):
+        # Alias the classifier weight onto the embedding so both share one
+        # tensor. get_classifier_weights() then returns the embedding matrix.
+        self.output_layer.weight = self.embedding.weight
 
     def _embed_tokens(self, x):
         if x.ndim == 3:
             bag = self.embedding(x)
-            return bag.float().mean(dim=-2).to(bag.dtype)
-
-        return self.embedding(x)
+            emb = bag.float().mean(dim=-2).to(bag.dtype)
+        else:
+            emb = self.embedding(x)
+        # Paper's sqrt(d) upscale gives an RMS of 1 going into the model -- but it is
+        # only safe when embeddings are UNTIED. With tying (the shared input/output
+        # weight) it makes the residual stream dominated by the current token, so the
+        # tied head self-predicts the current token and is confidently wrong on the
+        # next-token objective at init. We therefore apply it only when untied; the
+        # 1/sqrt(d) matrix init (which sets the MuonMD sphere radii) is kept either
+        # way, and the first RMSNorm renormalizes activations regardless.
+        if not self.tie_word_embeddings:
+            emb = emb * (self.config.hidden_size ** 0.5)
+        return emb
 
     def _run_layers(self, x, position_ids, s_value, cu_seqlens, unpad_indices, max_seqlen):
         all_topk_indices = []
