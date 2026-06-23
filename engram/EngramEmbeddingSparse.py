@@ -132,7 +132,7 @@ class EngramEmbeddingSparse(nn.Module):
         self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.int64))
         # SPARSE gradient: backward produces a COO grad over the touched rows only.
         self.embedding = nn.Embedding(sum(head_sizes), int(config.dim_per_head),
-                                      sparse=True)
+                                      sparse=True, dtype=torch.bfloat16)
 
         self.value_proj = nn.Linear(config.engram_dim, config.d_model)
         # Gate on the memory residual (per-channel LayerScale). When learned_gate is
@@ -165,7 +165,7 @@ class EngramEmbeddingSparse(nn.Module):
             gi = torch.Generator().manual_seed(int(base_seed) + 1)
             ri = torch.randint(0, half, (self.max_order,), generator=gi, dtype=torch.int64)
             self.register_buffer("imp_multipliers", ri * 2 + 1)
-            self.imp_table = nn.Embedding(sum(head_sizes), 1, sparse=True)
+            self.imp_table = nn.Embedding(sum(head_sizes), 1, sparse=True, dtype=torch.bfloat16)
             nn.init.ones_(self.imp_table.weight)
 
     @torch.no_grad()
