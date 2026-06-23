@@ -1,20 +1,15 @@
 """Vendored Liger RoPE kernel, modified to accept separate cos/sin for Q and K.
 
-The original Liger kernel applies one (cos, sin) to both Q and K, which works
-for standard RoPE because positions are symmetric across query and key. This
-fork takes (q_cos, q_sin, k_cos, k_sin) so Q and K can be rotated by different
-angles within the same head_dim. Used by the three-band rotation scheme:
+The original Liger kernel applies one (cos, sin) to both Q and K. This fork
+takes (q_cos, q_sin, k_cos, k_sin) so Q and K can in principle be rotated by
+different angles within the same head_dim. The model currently uses it for the
+symmetric two-band scheme (the same cos/sin is passed for Q and K):
 
-  pairs [0 .. pos_pairs)            : symmetric position-RoPE
-                                      (Q and K share the same cos/sin)
-  pairs [pos_pairs .. pos_pairs+s_pairs) : asymmetric S-RoPE
-                                      (Q gets identity cos=1/sin=0,
-                                       K gets log2(s)-driven cos/sin)
-  pairs [pos_pairs+s_pairs .. hd/2) : NoPE (identity for both)
+  pairs [0 .. pos_pairs)    : symmetric position-RoPE
+  pairs [pos_pairs .. hd/2) : NoPE (identity for both)
 
-The asymmetry on the S-band is essential: applying R(s) symmetrically to both Q
-and K would cancel under Q.K^T, destroying the s signal. K-only rotation makes
-Q.K^T s-conditional via a non-canceling bilinear form.
+The separate-Q/K signature is retained for generality (e.g. a future asymmetric
+band), but no asymmetric rotation is applied today.
 
 All shape/stride conventions are unchanged from the upstream Liger kernel.
 """
@@ -188,9 +183,9 @@ def rope_backward(dq, dk, q_cos, q_sin, k_cos, k_sin):
 class LigerRopeFunction(torch.autograd.Function):
     """Triton RoPE op with separate cos/sin for Q and K.
 
-    For the symmetric case (standard RoPE), pass the same tensors for both
-    Q and K. For asymmetric rotations (e.g. S-RoPE on K only), pass identity
-    cos/sin (cos=1, sin=0) on the side that should not rotate.
+    For the symmetric case (standard RoPE), pass the same tensors for both Q
+    and K. The signature also allows asymmetric rotations (different cos/sin
+    per side), though the model does not use that path currently.
     """
 
     @staticmethod

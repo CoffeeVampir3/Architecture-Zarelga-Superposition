@@ -6,7 +6,7 @@ from safetensors.torch import load_file
 from transformers import PreTrainedTokenizerFast
 
 from modeling.model import MoEModel
-from modeling.model_config import ModelConfig
+from model_variants import build_config
 
 
 ROOT = Path(__file__).resolve().parent
@@ -117,7 +117,9 @@ def main():
         torch.manual_seed(args.seed)
 
     tokenizer = load_tokenizer(args.tokenizer)
-    config = ModelConfig(vocab_size=len(tokenizer))
+    # Same variant the trainer used (model_variants.py is the single source of truth),
+    # so the checkpoint's architecture -- Engram included -- matches by construction.
+    config = build_config(len(tokenizer), tokenizer.pad_token_id)
 
     model = MoEModel(config).cuda().eval()
     state_dict = load_file(str(args.checkpoint), device="cuda")

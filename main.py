@@ -14,10 +14,13 @@ from utils.trainutils import AimLogger, count_parameters_layerwise, save_checkpo
 from utils.tokenizer import load_tokenizer
 from modeling.model import MoEModel
 from optimizer.muon import SingleDeviceMuonMDWithAuxAdam
+from optimizer.hybrid import HybridGraphOptimizer
+from engram.GramReaperSparse import GramReaperSparse
 from modeling.model_config import (
     ModelConfig,
     SUPERPOSITION_REFERENCE_SIZE,
 )
+from model_variants import build_config
 from cut_cross_entropy import linear_cross_entropy
 from modeling.mcce_fast_v2 import mcce_raw_token_mean_v2
 
@@ -153,6 +156,8 @@ def load_and_preprocess_data(data_dir="outputs", max_length=ModelConfig.sequence
 
 # Auxillary loss free routing: https://arxiv.org/abs/2408.15664
 # TLDR is that this does a direct update (not via backward) to the expert biases which will tip towards underfilled experts.
+# `update_rate` is the bias-update speed (DeepSeek-V3's gamma). It is the *only* load-balancing
+# force here, so it must be strong enough to overcome routing drift: V3 uses 1e-3 (see train()).
 def auxillary_loss_free_update(model, all_topk_indices, update_rate, attention_mask=None):
     valid_tokens = attention_mask.bool() if attention_mask is not None else None
 
@@ -223,15 +228,15 @@ def bucket_max_seqlen(max_seqlen, max_length):
 def sample_superposition_size(t: float, max_size: int) -> int:
     """Pick a packing group size s from a simple two-phase schedule.
 
-      - t ∈ [0.0, 0.4): s = 8 (token grouping in groups of 8)
-      - t ∈ [0.4, 1.0]: s = 1 (normal raw-token training)
+      - t ∈ [0.0, 0.1): s = max_size (token grouping in groups of max_size)
+      - t ∈ [0.1, 1.0]: s = 1 (normal raw-token training)
 
-    s is clamped to max_size; when max_size <= 1 (TST disabled) s is always 1.
+    when max_size <= 1 (TST disabled) s is always 1.
     """
     if max_size <= 1:
         return 1
-    if t < 0.4:
-        return min(8, max_size)
+    if t < 0.1:
+        return max_size
     return 1
 
 
@@ -348,9 +353,12 @@ def build_token_superposition_batch(batch, superposition_bag_size, latent_sequen
 
 def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
                            momentum=0.95, gain_lr=1e-3,
-                           adam_betas=(0.9, 0.95), adam_eps=1e-16):
-    """Split params into a Muon (Magnitude-Direction) group and an aux-Adam group,
-    and build a capturable single-device MuonMD optimizer.
+                           adam_betas=(0.9, 0.95), adam_eps=1e-16,
+                           embedding_weight_decay=0.1,
+                           embedding_lr=3e-3, embedding_beta=0.9,
+                           capture_warmup_steps=5):
+    """Build the HybridGraphOptimizer: a CUDA-graph-captured dense MuonMD + aux-Adam
+    optimizer, plus an eager GramReaperSparse for the sparse input embedding.
 
     Muon group (Frobenius sphere): attention q/k/v/o and head gate, the shared-expert
     MLPs, and the 3-D routed-expert stacks (E, out, in) (handled as E independent
@@ -358,31 +366,66 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
     Router group (row sphere): the MoE router gate, normalized along the expert axis
     (each expert's gating row on its own sphere), with the standard Muon shape factor
     max(1, sqrt(dout/din)) so the wide router matrix isn't scaled away from `lr` --
-    per the paper's MoE recipe.
-    Adam group: the tied input/output embedding and all 1-D params (ZeroCenteredRMSNorm
-    gains, the final norm, any biases).
+    per the paper's MoE recipe. gain_mode="col" (not the "both" default): a per-row
+    gain is a per-expert magnitude that would undo the row-sphere normalization and
+    let popular experts inflate their gating scores (rich-get-richer collapse), so the
+    router keeps only the per-input-feature (column) gain, which is shared across
+    experts. Load balancing is left entirely to the aux-loss-free bias.
+    Output-head Adam group: the (dense) output_layer, with weight decay. Its gradient
+    is dense (every vocab row participates in the softmax each step), so it stays in
+    the captured dense optimizer rather than the sparse path.
+    Scalar Adam group: all 1-D params (ZeroCenteredRMSNorm gains, the final norm, any
+    biases) with NO weight decay -- decaying gains would fight the normalization layers.
 
-    Learning rates are 0-dim CUDA tensors so a CUDA-graph-captured step() reads the
-    scheduler's in-place updates on every replay. capturable=True keeps the Adam step
-    counters on-device so bias correction stays correct across graph replays.
+    Sparse embedding (GramReaperSparse, eager): the input embedding table trains on its
+    own per-row RMSProp with a unit-sphere projection (unit_norm=True), consuming the
+    COO gradient nn.Embedding(sparse=True) produces. Its step has data-dependent shapes
+    and a host sync, so it cannot be captured and runs outside the graph every step.
+
+    Dense-group learning rates are 0-dim CUDA tensors so a CUDA-graph-captured step()
+    reads the scheduler's in-place updates on every replay. capturable=True keeps the
+    Adam step counters on-device so bias correction stays correct across graph replays.
+    The sparse group's LR is a plain float (eager step), updated in place by the scheduler.
     """
-    muon_params, router_params, adam_params = [], [], []
+    embedding_param = model.embedding.weight
+
+    # Engram n-gram tables are sparse-gradient too, but zero-init and NOT unit-norm
+    # constrained, so they ride their own GramReaperSparse group (unit_norm=False)
+    # rather than the input embedding's sphere group. Their dense side-modules
+    # (value_proj matrix -> Muon, value_proj bias + alpha -> scalar Adam) fall through
+    # the normal name/ndim split below.
+    engram_sparse_params = []
+    engrams = getattr(model, "engrams", None)
+    if engrams is not None:
+        for engram in engrams.values():
+            engram_sparse_params.append(engram.embedding.weight)
+            if engram.importance_weighting:
+                engram_sparse_params.append(engram.imp_table.weight)
+    sparse_param_ids = {id(embedding_param)} | {id(p) for p in engram_sparse_params}
+
+    muon_params, router_params, embed_params, scalar_params = [], [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        is_embedding = ('embedding' in name) or ('output_layer' in name)
+        if id(param) in sparse_param_ids:
+            continue  # routed to a sparse optimizer group below
+        # The dense output head (untied LM head) -- dense grad, stays in aux-Adam.
+        is_head = ('output_layer' in name)
         # The MoE router gate lives at `layers.*.mlp.gate.weight`; normalize it along
         # the expert axis (rows). The attention head gate (`...head_gate_proj.weight`)
         # and the shared-expert gate (`...shared_experts.gate_proj.weight`) do NOT match.
         is_router = ('mlp.gate.weight' in name)
-        if param.ndim >= 2 and not is_embedding:
+        if is_head:
+            embed_params.append(param)
+        elif param.ndim >= 2:
             (router_params if is_router else muon_params).append(param)
         else:
-            adam_params.append(param)
+            scalar_params.append(param)
 
     muon_lr_tensor = torch.tensor(float(muon_lr), device=device)
     router_lr_tensor = torch.tensor(float(muon_lr), device=device)
-    adam_lr_tensor = torch.tensor(float(adam_lr), device=device)
+    embed_lr_tensor = torch.tensor(float(adam_lr), device=device)
+    scalar_lr_tensor = torch.tensor(float(adam_lr), device=device)
 
     param_groups = [
         dict(params=muon_params, use_muon=True, lr=muon_lr_tensor,
@@ -392,13 +435,34 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
         param_groups.append(
             dict(params=router_params, use_muon=True, lr=router_lr_tensor,
                  momentum=momentum, gain_lr=gain_lr, norm_axis="row",
-                 rescale_mode="muon", capturable=True),
+                 gain_mode="col", rescale_mode="muon", capturable=True),
+        )
+    if embed_params:
+        param_groups.append(
+            dict(params=embed_params, use_muon=False, lr=embed_lr_tensor,
+                 betas=adam_betas, eps=adam_eps,
+                 weight_decay=embedding_weight_decay, capturable=True),
         )
     param_groups.append(
-        dict(params=adam_params, use_muon=False, lr=adam_lr_tensor,
+        dict(params=scalar_params, use_muon=False, lr=scalar_lr_tensor,
              betas=adam_betas, eps=adam_eps, weight_decay=0.0, capturable=True),
     )
-    return SingleDeviceMuonMDWithAuxAdam(param_groups)
+    dense_optimizer = SingleDeviceMuonMDWithAuxAdam(param_groups)
+
+    # Sphere-constrained per-row RMSProp on the sparse embedding table (paper: keep
+    # embedding rows at unit L2 norm throughout, no weight decay). Engram tables, if
+    # present, get a second group with unit_norm=False: they are zero-init and must
+    # keep their untouched zero rows at zero (a sphere projection would push them off).
+    sparse_param_groups = [dict(params=[embedding_param], unit_norm=True)]
+    if engram_sparse_params:
+        sparse_param_groups.append(dict(params=engram_sparse_params, unit_norm=False))
+    sparse_optimizer = GramReaperSparse(
+        sparse_param_groups, lr=float(embedding_lr), beta=embedding_beta, unit_norm=True,
+    )
+
+    return HybridGraphOptimizer(
+        dense_optimizer, sparse_optimizer, capture_warmup_steps=capture_warmup_steps,
+    )
 
 def _lr_scalar(value):
     return value.item() if torch.is_tensor(value) else value
@@ -521,7 +585,8 @@ def train(
     batch_size=16,
     muon_lr=0.02,
     adam_lr=3e-4,
-    update_rate=1e-5,
+    update_rate=1e-3,
+    embedding_weight_decay=0.1,
     checkpoint_interval_steps=10_000,
     max_rolling_checkpoints=5,
     superposition_max_size=SUPERPOSITION_REFERENCE_SIZE,
@@ -537,6 +602,7 @@ def train(
         model, device, muon_lr=muon_lr, adam_lr=adam_lr,
         momentum=muon_momentum, gain_lr=gain_lr,
         adam_betas=adam_betas, adam_eps=adam_eps,
+        embedding_weight_decay=embedding_weight_decay,
     )
 
     superposition_enabled = superposition_max_size > 1
@@ -558,6 +624,7 @@ def train(
 
     logger = AimLogger(repo='logs/aim', experiment='moe_training', detailed_frequency=20)
     logger.register_moe_layers(model)
+    logger.register_engrams(model)
     global_step = 0
 
     total_steps = len(train_loader) * num_epochs
@@ -582,7 +649,8 @@ def train(
         'optimizer_gain_lr': gain_lr,
         'adam_betas': adam_betas,
         'adam_eps': adam_eps,
-        'weight_decay': 0.0,
+        'weight_decay': 0.0,  # sphere (Muon/MD) groups -- no decay
+        'embedding_weight_decay': embedding_weight_decay,
         'lr_schedule': 'linear_decay_warmup_free',
         'warmup_steps': warmup_steps,
         'min_lr': muon_lr * scheduler.min_lr_ratio,
@@ -591,7 +659,16 @@ def train(
         'max_rolling_checkpoints': max_rolling_checkpoints,
         'attention/do_rope': model.config.do_rope,
         'attention/pos_rope_dims': model.config.pos_rope_dims,
-        'attention/s_rope_dims': model.config.s_rope_dims,
+        'engram/enabled': model.config.engram.enabled,
+        'engram/layers': list(model.config.engram.layers),
+        'engram/orders': list(model.config.engram.orders),
+        'engram/n_heads': model.config.engram.n_heads,
+        'engram/rows_per_head': model.config.engram.rows_per_head,
+        'engram/dim_per_head': model.config.engram.dim_per_head,
+        'engram/alpha_init': model.config.engram.alpha_init,
+        'engram/importance_weighting': model.config.engram.importance_weighting,
+        'engram/head_norm': model.config.engram.head_norm,
+        'engram/learned_gate': model.config.engram.learned_gate,
         'token_superposition/enabled': superposition_enabled,
         'token_superposition/max_size': superposition_max_size,
         'token_superposition/max_raw_sequence_length': superposition_raw_length,
@@ -639,16 +716,15 @@ def train(
     step_idx = 0
     optimizer_step_count = 0
     last_checkpoint_step = 0
-    # CUDA-graph capture of the optimizer step: run a few eager steps first to
-    # initialise optimizer state (momentum buffers, gains, on-device step counters)
-    # and warm cuBLAS for the Newton-Schulz matmuls, then capture step() once and
-    # replay it every subsequent step.
-    opt_graph = None
-    capture_warmup_steps = 5
+    # The optimizer (HybridGraphOptimizer) owns the CUDA-graph capture-once/replay-many
+    # state machine for its dense MuonMD + aux-Adam step, and steps the eager sparse
+    # embedding optimizer outside the graph. See optimizer/hybrid.py.
     pbar = tqdm(total=total_steps)
     while step_idx < total_steps:
-        # set_to_none=False keeps grad buffers at stable addresses across iterations,
-        # which the captured optimizer-step graph reads from on every replay.
+        # set_to_none=False keeps the dense grad buffers at stable addresses across
+        # iterations, which the captured optimizer-step graph reads on every replay.
+        # The coordinator overrides this to set_to_none=True for the sparse embedding
+        # grad (a fresh COO tensor each backward that cannot be zeroed in place).
         optimizer.zero_grad(set_to_none=False)
 
         t = step_idx / max(1, total_steps - 1)
@@ -671,7 +747,6 @@ def train(
                 embeddings, all_topk_indices = model.headless_forward(
                     input_ids,
                     position_ids=position_ids,
-                    s_value=1,
                     cu_seqlens=cu_seqlens,
                     unpad_indices=unpad_indices,
                     max_seqlen=max_seqlen,
@@ -709,7 +784,6 @@ def train(
                 embeddings, all_topk_indices = model.headless_forward(
                     input_ids,
                     position_ids=position_ids,
-                    s_value=s,
                     cu_seqlens=cu_seqlens,
                     unpad_indices=unpad_indices,
                     max_seqlen=max_seqlen,
@@ -729,21 +803,10 @@ def train(
 
         loss.backward()
 
-        # Capture-once / replay-many optimizer step. The step only reads parameters
-        # and their fixed-shape grads, so it is CUDA-graph-safe even though the forward
-        # is dynamic. CUDA-graph capture records but does not execute, so replay
-        # immediately to apply this step's update. The TST skip path above `continue`s
-        # before reaching here, so a skipped batch never triggers a replay.
-        if opt_graph is not None:
-            opt_graph.replay()
-        elif optimizer_step_count >= capture_warmup_steps:
-            torch.cuda.synchronize()
-            opt_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(opt_graph):
-                optimizer.step()
-            opt_graph.replay()
-        else:
-            optimizer.step()
+        # Dense step is captured-once/replayed and the sparse embedding step runs
+        # eagerly; the coordinator handles both. The TST skip path above `continue`s
+        # before reaching here, so a skipped batch never triggers a step.
+        optimizer.step()
 
         loss_value = loss.item()
         entropy_floor_value = entropy_floor.item()
@@ -782,14 +845,13 @@ def train(
         )
 
         epoch = step_idx // max(1, len(train_loader))
-        metrics = logger.log_training_metrics(loss, optimizer, update_rate, global_step, epoch, step_idx)
+        metrics = logger.log_training_metrics(loss, optimizer, update_rate)
         metrics.update(logger.log_moe_metrics(all_topk_indices, global_step, attention_mask))
         metrics["loss/entropy_floor"] = entropy_floor_value
         metrics["loss/reducible_gap"] = loss_normalizer_value
         metrics["token_superposition/s"] = s
         metrics["token_superposition/schedule_t"] = t
         metrics["token_superposition/active_labels"] = active_labels
-        metrics["training/optimizer_steps"] = optimizer_step_count
         metrics[f"loss/s_{s}"] = loss_value
         metrics["mem/num_rows"] = num_rows
         metrics["mem/num_valid_tokens"] = num_valid_tokens
@@ -799,6 +861,7 @@ def train(
         metrics["mem/fragmentation_gb"] = frag_gb
 
         detailed_logging = (optimizer_step_count % logger.detailed_frequency == 0)
+        metrics.update(logger.log_engram_metrics(global_step, detailed=detailed_logging))
         logger.log(metrics, step=global_step, model=model, detailed_logging=detailed_logging)
 
         if checkpoint_interval_steps > 0 and (
@@ -823,8 +886,6 @@ def train(
         {
             'loss/train_loss': avg_loss,
             'training/train_time': train_time,
-            'training/total_steps': total_steps,
-            'training/optimizer_steps': optimizer_step_count,
         },
         step=global_step,
         detailed_logging=True,
@@ -844,23 +905,27 @@ def train(
     logger.close()
 
 def main():
-    # Token grouping (Token Superposition Training) enabled: groups of 8 for the
-    # first 40% of training, then s=1 (normal raw-token training) for the
-    # remaining 60%. S-RoPE on. See sample_superposition_size for the schedule.
-    superposition_enabled = True
-
-    bootstrap_config = ModelConfig(superposition_enabled=superposition_enabled)
-    data_max_length = bootstrap_config.sequence_length * bootstrap_config.superposition_max_size
+    # The model is declared once as a named variant in model_variants.py -- the single
+    # source of truth shared with inference.py. Only tokenizer-derived values
+    # (vocab_size, pad_token_id) are filled in per run; everything architectural,
+    # including Engram placement and whether TST is enabled, lives in the variant.
+    #
+    # Data sizing needs only the tokenizer-independent architecture constants
+    # (sequence length x superposition group size), so read them from the variant built
+    # with a placeholder vocab before the tokenizer is available.
+    sizing = build_config(vocab_size=1, pad_token_id=0)
+    data_max_length = sizing.sequence_length * sizing.superposition_max_size
 
     train_dataset, tokenizer, _ = load_and_preprocess_data(max_length=data_max_length)
-    config = ModelConfig(
-        vocab_size=len(tokenizer),
-        superposition_enabled=superposition_enabled,
-    )
+    config = build_config(len(tokenizer), tokenizer.pad_token_id)
 
     model = MoEModel(config)
 
     count_parameters_layerwise(model)
+    # The full headless_forward is compiled, including the nn.Embedding(sparse=True)
+    # lookup. Measured (measure_sparse_compile.py): inductor keeps the embedding's COO
+    # gradient sparse (nnz == touched rows) through a compiled fwd+bwd with zero graph
+    # breaks (fullgraph=True passes), so GramReaperSparse still receives a sparse grad.
     model.headless_forward = torch.compile(model.headless_forward, dynamic=True)
     train(
         model,

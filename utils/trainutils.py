@@ -96,6 +96,7 @@ class AimLogger:
         self.detailed_frequency = detailed_frequency
         self.start_time = time.time()
         self.moe_layers = []
+        self.engrams = []
 
     def log_params(self, params):
         self.run["hparams"] = params
@@ -140,14 +141,88 @@ class AimLogger:
 
         return metrics
 
-    def log_training_metrics(self, loss, optimizer, update_rate, global_step, epoch, batch_idx):
+    def register_engrams(self, model):
+        """Snapshot (layer_idx, module) for each Engram branch so metrics can be
+        attributed per layer. nn.ModuleDict is keyed by the string layer index."""
+        self.engrams = []
+        engrams = getattr(model, 'engrams', None)
+        if engrams is None:
+            return
+        for key, engram in engrams.items():
+            self.engrams.append((int(key), engram))
+
+    def log_engram_metrics(self, step, detailed=False):
+        """Per-Engram memory diagnostics.
+
+        Cheap, every-step signals:
+          * rows_activated      -- unique table rows touched this step (nnz of the COO
+            grad). The table is addressed by hashed n-grams, so this is how much of the
+            memory each step exercises. Read off engram.embedding.weight.grad, which
+            still holds this backward's sparse grad until the next zero_grad.
+          * rows_activated_frac -- the same as a fraction of total rows.
+          * alpha_abs_mean      -- mean |LayerScale|, i.e. how hard the model gates the
+            memory residual in (alpha->0 means the branch is being ignored).
+
+        Detailed-cadence signals (full-table reductions / distributions):
+          * grad_row_norm_mean  -- mean per-row grad norm of touched rows (the learning
+            signal flowing into memory; the generic stats skip sparse grads).
+          * row_norm / alpha    -- distributions (heavy tail => a few hot n-grams).
+
+        Note: a cumulative-occupancy metric was removed -- the table is tiny relative to
+        the n-gram traffic (one step's lookups oversubscribe each head's rows), so it
+        saturates to ~1.0 within a few steps and can't discriminate table sizes.
+        """
+        if not self.engrams:
+            return {}
+
+        metrics = {}
+        for layer_idx, engram in self.engrams:
+            prefix = f'engram/layer_{layer_idx}'
+            weight = engram.embedding.weight
+            total_rows = weight.shape[0]
+
+            grad = weight.grad
+            if grad is not None and grad.is_sparse:
+                coalesced = grad.coalesce()
+                idx = coalesced.indices()[0]
+                activated = idx.numel()
+                metrics[f'{prefix}/rows_activated'] = activated
+                metrics[f'{prefix}/rows_activated_frac'] = activated / total_rows
+                if detailed and activated > 0:
+                    g = coalesced.values()
+                    metrics[f'{prefix}/grad_row_norm_mean'] = g.norm(dim=1).mean().item()
+
+            alpha = engram.alpha.detach()
+            metrics[f'{prefix}/alpha_abs_mean'] = alpha.abs().mean().item()
+
+            # Importance weighting (a 2nd hash gating each head): the table is ones-init
+            # (identity), so the signal is how far the touched weights have drifted from
+            # 1.0 -- i.e. how much the model is up/down-weighting heads per n-gram.
+            if detailed and getattr(engram, 'importance_weighting', False):
+                imp_weight = engram.imp_table.weight
+                imp_grad = imp_weight.grad
+                if imp_grad is not None and imp_grad.is_sparse:
+                    imp_idx = imp_grad.coalesce().indices()[0]
+                    if imp_idx.numel() > 0:
+                        vals = imp_weight.detach()[imp_idx].squeeze(-1)
+                        metrics[f'{prefix}/imp_mean'] = vals.mean().item()
+                        metrics[f'{prefix}/imp_abs_dev'] = (vals - 1.0).abs().mean().item()
+                        metrics[f'{prefix}/imp'] = vals
+
+            if detailed:
+                row_norms = weight.detach().norm(dim=1)
+                written = row_norms[row_norms > 0]
+                if written.numel() > 0:
+                    metrics[f'{prefix}/row_norm'] = written
+                metrics[f'{prefix}/alpha'] = alpha
+
+        return metrics
+
+    def log_training_metrics(self, loss, optimizer, update_rate):
         metrics = {
             'loss/batch_loss': loss.item() if torch.is_tensor(loss) else loss,
             'training/learning_rate': optimizer.param_groups[0]['lr'],
             'training/update_rate': update_rate,
-            'training/global_step': global_step,
-            'training/epoch': epoch,
-            'training/batch_in_epoch': batch_idx
         }
 
         return metrics
@@ -156,7 +231,14 @@ class AimLogger:
         layer_match = re.search(r'layers\.(\d+)', name)
         layer_num = int(layer_match.group(1)) if layer_match else -1
 
-        if 'mlp' in name or 'expert' in name:
+        # Engram memory tables are named `engrams.<L>.embedding.weight`, so they'd
+        # otherwise fall into the 'embed' bucket below and pollute the token
+        # embedding's norm stats. They're intentionally not unit-norm constrained
+        # (associative-memory slots, not a normalized vocab matrix), so their
+        # unbounded growth is expected -- keep them on their own line.
+        if 'engram' in name:
+            layer_type = 'engram'
+        elif 'mlp' in name or 'expert' in name:
             layer_type = 'mlp'
         elif 'attn' in name or 'self_attn' in name:
             layer_type = 'attention'
@@ -248,7 +330,11 @@ class AimLogger:
                 param_stats_by_layer[layer_num]['std_sum'] += param_std
                 param_stats_by_layer[layer_num]['count'] += 1
 
-            if param.grad is not None:
+            # Skip sparse-gradient params (the nn.Embedding(sparse=True) table): the
+            # dense reductions below aren't registered for the Sparse backend, and
+            # coalescing + reducing would add host syncs to a diagnostic. The embedding
+            # weight-norm stats above still log; only its grad stats are dropped.
+            if param.grad is not None and not param.grad.is_sparse:
                 if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                     problematic_grads += 1
                     continue

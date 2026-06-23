@@ -1,0 +1,848 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Architecture Notes: Per-Layer Embedding and Engram-Style Networks</title>
+  <style>
+    :root {
+      --bg: #f7f8f5;
+      --ink: #1c2430;
+      --muted: #596675;
+      --line: #d8ded6;
+      --panel: #ffffff;
+      --panel-2: #f0f4f7;
+      --accent: #0f6c64;
+      --accent-2: #8b3f2f;
+      --accent-3: #355f92;
+      --warn: #7a5a00;
+      --code: #111827;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfa;
+    }
+    .wrap {
+      width: min(1180px, calc(100vw - 40px));
+      margin: 0 auto;
+    }
+    header .wrap {
+      padding: 26px 0 22px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(28px, 4vw, 46px);
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 34px 0 12px;
+      font-size: 24px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+    h3 {
+      margin: 24px 0 8px;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+    p { margin: 0 0 12px; }
+    a { color: var(--accent-3); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+      color: var(--code);
+      background: #eef1ed;
+      border: 1px solid #dce2dc;
+      border-radius: 5px;
+      padding: 1px 5px;
+    }
+    main .wrap { padding: 20px 0 48px; }
+    .sub {
+      color: var(--muted);
+      max-width: 920px;
+      font-size: 16px;
+    }
+    .note {
+      background: #fff7e6;
+      border: 1px solid #ead7a4;
+      border-left: 4px solid var(--warn);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin: 14px 0 20px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin: 16px 0 24px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .card h3 { margin-top: 0; }
+    .tagrow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 10px 0 0;
+    }
+    .tag {
+      font-size: 12px;
+      border: 1px solid #cbd6d1;
+      color: #24433f;
+      background: #eef7f5;
+      border-radius: 999px;
+      padding: 2px 8px;
+      white-space: nowrap;
+    }
+    .tag.alt { color: #4d342e; background: #fbf0ec; border-color: #ead1c8; }
+    .tag.sys { color: #273c61; background: #eef3fb; border-color: #cfdaf0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      margin: 14px 0 24px;
+      font-size: 14px;
+    }
+    th, td {
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+      padding: 10px 11px;
+      text-align: left;
+    }
+    th {
+      background: var(--panel-2);
+      color: #24313f;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    tr:last-child td { border-bottom: 0; }
+    .snippet {
+      display: inline;
+      color: #2f4f4b;
+      background: #eef7f5;
+      border: 1px solid #cfe1dc;
+      border-radius: 5px;
+      padding: 1px 5px;
+      font-size: 12.5px;
+      white-space: normal;
+    }
+    .diagram {
+      background: #101923;
+      color: #eef5f2;
+      border-radius: 8px;
+      padding: 14px;
+      overflow-x: auto;
+      font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      margin: 12px 0 20px;
+      border: 1px solid #263241;
+    }
+    .placement-map {
+      min-width: 1420px;
+    }
+    .placement-cell {
+      width: 280px;
+      min-width: 280px;
+      padding: 8px;
+    }
+    .placement-img {
+      display: block;
+      width: 264px;
+      max-width: 100%;
+      height: auto;
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      background: #002b36;
+      border: 1px solid #0f4d5a;
+      border-radius: 8px;
+      box-shadow: 0 10px 24px rgba(0, 43, 54, 0.18), 0 0 18px rgba(42, 161, 152, 0.14);
+    }
+    .placement-cell a {
+      display: block;
+      color: inherit;
+      text-decoration: none;
+    }
+    .split {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 16px;
+      align-items: start;
+    }
+    .small { font-size: 13px; color: var(--muted); }
+    .source-list li { margin: 5px 0; }
+    .warntext { color: var(--warn); font-weight: 650; }
+    .ok { color: var(--accent); font-weight: 650; }
+    .no { color: var(--accent-2); font-weight: 650; }
+    details {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin: 10px 0;
+    }
+    summary { cursor: pointer; font-weight: 700; }
+    @media (max-width: 900px) {
+      .grid, .split { grid-template-columns: 1fr; }
+      .wrap { width: min(100vw - 24px, 1180px); }
+      th, td { padding: 9px 8px; }
+      table { font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>Architecture Notes</h1>
+      <p class="sub">Per-layer embedding and Engram-style neural architectures, restricted to the local curated corpus in <code>good_papers/</code> and implementation references in <code>good_references/</code>. This document does not synthesize an unverified new architecture.</p>
+    </div>
+  </header>
+
+  <main>
+    <div class="wrap">
+      <div class="note">
+        <b>Boundary:</b> every architecture statement below is tied to a cited local paper or reference snippet. Where a paper does not specify a detail, the note says <span class="warntext">not stated</span> instead of filling it in.
+      </div>
+
+      <section>
+        <h2>Short Answer</h2>
+        <div class="grid">
+          <div class="card">
+            <h3>Per-layer embedding</h3>
+            <p>The important architectural choice is inside the FFN: most PLE/STEM descriptions attach the token-indexed table on the SwiGLU up-projection/value side, while preserving the hidden-state gate and down projection.</p>
+            <div class="tagrow">
+              <span class="tag">token-indexed</span>
+              <span class="tag">inside FFN</span>
+              <span class="tag">per layer</span>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Engram</h3>
+            <p>The important architectural choice is before the normal block compute at selected layers: Engram adds a residual memory branch to the hidden state, then the block continues through attention and MoE/FFN.</p>
+            <div class="tagrow">
+              <span class="tag alt">n-gram lookup</span>
+              <span class="tag alt">context gate</span>
+              <span class="tag alt">residual add</span>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Related memory layers</h3>
+            <p>The related papers mostly answer placement differently: replace FFNs, insert cross-attention memory layers, augment an attention layer, or route to expert FFNs. Those placements are not interchangeable.</p>
+            <div class="tagrow">
+              <span class="tag sys">PKM</span>
+              <span class="tag sys">kNN</span>
+              <span class="tag sys">cross-attn memory</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Where Embeddings Go</h2>
+        <p>This is the placement map the papers actually support. The rows distinguish the neural insertion point from the addressing method, because two methods can both use "embeddings" while attaching them to different places in the network.</p>
+        <h3>Notation and block anatomy</h3>
+        <p>The formulas in this section are not new assumptions; they are labels for parts of a standard gated FFN/SwiGLU sublayer so the paper snippets can be mapped to an actual network location.</p>
+        <div class="split">
+          <div>
+            <div class="diagram">Transformer decoder layer, simplified
+  h_in
+    -> self-attention sublayer
+    -> add back to residual stream
+    -> FFN / MLP sublayer
+    -> add back to residual stream
+
+Standard gated FFN / SwiGLU
+  hidden vector x
+    -> gate branch:  SiLU(Wg x)
+    -> value branch: Wu x
+    -> multiply those two FFN-width vectors element by element
+    -> down branch:  Wd maps the result back to model width</div>
+          </div>
+          <div class="card">
+            <h3>Symbol meanings</h3>
+            <p><code>l</code>: layer index. A subscript such as <code>Wg_l</code> means "the gate projection used by layer <code>l</code>."</p>
+            <p><code>i</code>: token position in the sequence. A subscript such as <code>x_i</code> means "the hidden vector at position <code>i</code>."</p>
+            <p><code>x</code> or <code>x_l</code>: the current token position's hidden vector entering layer <code>l</code>'s FFN/MLP sublayer. It is not the raw token ID.</p>
+            <p><code>t</code> or <code>t_i</code>: the current tokenizer ID at token position <code>i</code>. This is used for table lookup.</p>
+            <p><code>d_model</code>: model hidden width. <code>d_ff</code>: FFN intermediate width after the up/gate projections and before the down projection.</p>
+            <p><code>Wg</code>: FFN gate projection. <code>SiLU(Wg x)</code> decides which intermediate channels are active for this hidden-state context.</p>
+            <p><code>Wu</code>: FFN up/value projection. <code>Wu x</code> is the normal context-derived candidate feature vector at FFN width.</p>
+            <p><code>Wd</code>: FFN down projection. It maps the FFN-width vector back to model width for the residual stream.</p>
+            <p><code>*</code>: elementwise multiply between same-width vectors, not matrix multiplication.</p>
+          </div>
+        </div>
+        <div class="note">
+          <b>Per-layer embedding notation:</b> <code>U_l</code> is the embedding table owned by layer <code>l</code>, with one row per token ID and width matching the FFN intermediate width in STEM. <code>U_l[t]</code> means "look up row <code>t</code> in layer <code>l</code>'s table." In STEM and LongCat-style PLE, that looked-up row is placed where the standard FFN would normally use <code>Wu x</code>.
+        </div>
+        <div class="diagram">STEM / LongCat-style per-layer embedding placement
+  hidden vector x
+    -> gate branch: SiLU(Wg x)
+
+  token id t
+    -> layer-specific table U_l
+    -> row U_l[t]
+
+  SiLU(Wg x) * U_l[t]
+    -> Wd maps back to model width
+    -> result is added through the layer's normal residual path</div>
+        <p class="small">Formula labels below are used only after these definitions; each row also spells out the tensor flow in prose.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Design</th>
+              <th>Where it is placed</th>
+              <th>Exact subgraph</th>
+              <th>What this means architecturally</th>
+              <th>Verifiable snippet</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>STEM</b></td>
+              <td>Inside selected decoder FFN layers, in the SwiGLU up-projection slot.</td>
+              <td>Standard value branch: <code>x -> Wu -> FFN-width vector</code>.<br>STEM value branch: <code>token id t -> U_l -> U_l[t]</code>.<br>Gate branch <code>SiLU(Wg x)</code> and down branch <code>Wd</code> stay in place.</td>
+              <td><code>U_l[t]</code> is the row for token ID <code>t</code> in layer <code>l</code>'s table. In STEM, this row stands in for the usual <code>Wu x</code> candidate-feature vector, while the current hidden vector <code>x</code> still controls the gate through <code>Wg</code>.</td>
+              <td><a href="good_papers/STEM_Scaling_Transformers_with_Embedding_Modules.pdf">STEM</a>: <span class="snippet">"replaces the FFN up-projection"</span></td>
+            </tr>
+            <tr>
+              <td><b>PLE as described by STEM</b></td>
+              <td>Inside each PLE decoder layer as an additional FFN-side PLE block, not a full FFN replacement.</td>
+              <td>The normal FFN remains, and a token-indexed PLE path is attached beside it in the decoder layer.</td>
+              <td>STEM's wording for prior PLE is an additional sparse parametric memory path coupled to FFN projections. This is different from STEM's own stricter replacement of the full up/value projection with a layer-local embedding lookup.</td>
+              <td><a href="good_papers/STEM_Scaling_Transformers_with_Embedding_Modules.pdf">STEM</a>: <span class="snippet">"complement the existing FFN"</span></td>
+            </tr>
+            <tr>
+              <td><b>PLE as formalized by LongCat</b></td>
+              <td>Inside the MLP of each dense sub-layer of shortcut layers.</td>
+              <td>LongCat's formula keeps <code>SiLU(Wg_l x_i)</code> and <code>Wd_l</code>, but replaces the up/value branch with <code>E0_l(t_i)</code>.</td>
+              <td><code>E0_l(t_i)</code> is LongCat's notation for the layer <code>l</code> embedding row selected by token ID <code>t_i</code>. The insertion is still in the MLP/FFN, not in attention.</td>
+              <td><a href="good_papers/Scaling_Embeddings_Outperforms_Scaling_Experts.pdf">LongCat</a>: <span class="snippet">"output of up-projection matrix"</span></td>
+            </tr>
+            <tr>
+              <td><b>PLNE</b></td>
+              <td>Same FFN/MLP location as LongCat PLE, but the inserted vector is an n-gram embedding output.</td>
+              <td>Same gate and down branches as LongCat PLE; the up/value-branch substitute is <code>e_i_l</code> instead of a single-token row.</td>
+              <td><code>e_i_l</code> is the per-layer n-gram embedding output for token position <code>i</code>. Architecturally, PLNE keeps the PLE placement but changes the source of the inserted FFN-width vector from single token ID to n-gram embedding.</td>
+              <td><a href="good_papers/Scaling_Embeddings_Outperforms_Scaling_Experts.pdf">LongCat</a>: <span class="snippet">"layer-specific embedding table and projection matrix"</span></td>
+            </tr>
+            <tr>
+              <td><b>RWKV DeepEmbed</b></td>
+              <td>Within the FFN of every model layer in the curated RWKV reference.</td>
+              <td><code>return value(x) * deepemb(idx)</code><br>or <code>return value(x * deepemb(idx))</code></td>
+              <td>This is another per-token, per-layer FFN modulation pattern. It places token-indexed embeddings in the FFN path, not in attention.</td>
+              <td><a href="good_references/rwkv_v8_deepembed_methodology.md">RWKV reference</a>: <span class="snippet">"within the FFN of every model layer"</span></td>
+            </tr>
+            <tr>
+              <td><b>Over-Encoding / base n-gram embedding</b></td>
+              <td>At the input embedding layer before the Transformer stack.</td>
+              <td>Before layer 0: token IDs and hashed n-gram IDs are looked up in input embedding tables and summed/projected into the initial hidden vector.</td>
+              <td><code>E1</code>, <code>E2</code>, and <code>E3</code> are input embedding tables for 1-gram, 2-gram, and 3-gram IDs. This scales input vocabulary/embedding capacity; it is not an internal per-layer placement unless combined with PLE-style placement such as PLNE.</td>
+              <td><a href="good_papers/2501.16975-over-tokenized-transformer-vocabulary-worth-scaling.pdf">Over-Tokenized Transformer</a>: <span class="snippet">"input embedding to the GPT model"</span></td>
+            </tr>
+            <tr>
+              <td><b>DeepSeek Engram</b></td>
+              <td>At selected Transformer blocks, before the normal attention/MoE work in the block.</td>
+              <td><code>h = h + Engram(h, token_ids)</code><br><code>h = h + Attention(h)</code><br><code>h = h + MoE(h)</code></td>
+              <td>Engram is a pre-attention residual memory branch. The embedding table is addressed by token IDs, but the retrieved value is written into the current hidden state through a gate before the block continues.</td>
+              <td><a href="good_papers/2601.07372-conditional-memory-scalable-lookup-engram.pdf">Engram</a>: <span class="snippet">"followed by the standard Attention and MoE"</span></td>
+            </tr>
+            <tr>
+              <td><b>Engram large-model placement</b></td>
+              <td>Only some layers. The reported 27B/40B setup uses layers <code>[2,15]</code>.</td>
+              <td><code>layer 2: Engram -> Attention -> MoE</code><br><code>layer 15: Engram -> Attention -> MoE</code></td>
+              <td>The paper does not propose an Engram at every layer. It reports an early layer plus a later layer, and ablates the modeling/latency tradeoff.</td>
+              <td><a href="good_papers/2601.07372-conditional-memory-scalable-lookup-engram.pdf">Engram appendix</a>: <span class="snippet">"Engram Layer [2,15]"</span></td>
+            </tr>
+            <tr>
+              <td><b>Engram ablation placement</b></td>
+              <td>In a 12-layer 3B MoE reference, the paper uses layers 2 and 6; single-module sweep finds layer 2 best.</td>
+              <td><code>reference: Engram@2 + Engram@6</code></td>
+              <td>Early placement offloads local pattern reconstruction, but later placement has better contextual gating. The paper treats placement as a tradeoff, not a fixed universal rule.</td>
+              <td><a href="good_papers/2601.07372-conditional-memory-scalable-lookup-engram.pdf">Engram ablation</a>: <span class="snippet">"Layer 2 achieves the best"</span></td>
+            </tr>
+            <tr>
+              <td><b>TN-gram</b></td>
+              <td>Same selected-block placement as Engram.</td>
+              <td><code>h = h + TNgramMemory(h, token_ids)</code></td>
+              <td>TN-gram changes the memory parameterization from hash tables to CP factors. It does not change the network insertion point.</td>
+              <td><a href="good_papers/2606.08347-tensorizing-engram-tn-gram.pdf">TN-gram</a>: <span class="snippet">"selected Transformer blocks"</span></td>
+            </tr>
+            <tr>
+              <td><b>Memory Grafting</b></td>
+              <td>Same Engram-style residual write point at chosen recipient layers.</td>
+              <td><code>exact lookup hit ? grafted vector : hash Engram vector</code><br><code>h = h + GateConv(value)</code></td>
+              <td>Memory Grafting changes where values come from, not where they are injected: exact frozen n-gram memory on hits, hash Engram fallback on misses, same gate/ShortConv residual update.</td>
+              <td><a href="good_papers/2605.20948-memory-grafting-offline-conditional-memory.pdf">Memory Grafting</a>: <span class="snippet">"gated residual update"</span></td>
+            </tr>
+            <tr>
+              <td><b>Memory Layers at Scale</b></td>
+              <td>Replaces one or more FFN layers with a trainable key-value memory layer.</td>
+              <td><code>Transformer block: Attention -> MemoryLayer</code> instead of <code>Attention -> FFN</code></td>
+              <td>This is an FFN replacement, not an extra pre-attention branch. The improved Memory+ setup uses 3 shared-parameter memory layers in centered placements.</td>
+              <td><a href="good_papers/Memory_Layers_at_Scale_Meta_FAIR.pdf">Memory Layers</a>: <span class="snippet">"replacing the feed-forward network"</span></td>
+            </tr>
+            <tr>
+              <td><b>Product-Key Memory</b></td>
+              <td>Replaces the FFN layer in selected Transformer blocks, typically only <code>N in {0,1,2}</code> layers in the paper's wording.</td>
+              <td><code>x = x + PKM(x)</code> instead of <code>x = x + FFN(x)</code></td>
+              <td>PKM is a sparse FFN-like layer with learned query/key/value memory. It does not use token-id n-gram addressing.</td>
+              <td><a href="good_papers/1907.05242-large-memory-layers-with-product-keys.pdf">PKM</a>: <span class="snippet">"replace the FFN layer"</span></td>
+            </tr>
+            <tr>
+              <td><b>Hash Layers</b></td>
+              <td>Replaces Transformer FFN sublayers with hash-routed expert FFNs.</td>
+              <td><code>h_l_t = FFN_hash(x_t)(hbar_l_t)</code></td>
+              <td>The embedding-like address is used to choose which FFN weights run. The hidden state is still processed by an expert FFN; no memory vector is added directly.</td>
+              <td><a href="good_papers/2106.04426-hash-layers-for-large-sparse-models.pdf">Hash Layers</a>: <span class="snippet">"FFN sublayers with expert modules"</span></td>
+            </tr>
+            <tr>
+              <td><b>Memorizing Transformer</b></td>
+              <td>One attention layer near the top of the stack is replaced by a kNN-augmented attention layer.</td>
+              <td><code>Attention = gate * kNN_attention + (1-gate) * local_attention</code></td>
+              <td>This placement is attention augmentation, not FFN embedding and not Engram-style residual memory before attention.</td>
+              <td><a href="good_papers/2203.08913-memorizing-transformers.pdf">Memorizing Transformer</a>: <span class="snippet">"near the top of the stack"</span></td>
+            </tr>
+            <tr>
+              <td><b>MoC</b></td>
+              <td>Memory cross-attention layers are inserted at specified decoder layers.</td>
+              <td><code>H' = H + CrossAttention(H, selected_memory_chapters)</code></td>
+              <td>The paper specifies memory cross-attention at layers <code>{2,6,10,14}</code>. It does not define this as an FFN up-projection replacement or n-gram Engram branch.</td>
+              <td><a href="good_papers/Mixture_of_Chapters_Scaling_Learnt_Memory_in_Transformers.pdf">MoC</a>: <span class="snippet">"cross-attention inserted at layers"</span></td>
+            </tr>
+            <tr>
+              <td><b>FwPKM</b></td>
+              <td>Inserted before the token mixer; standard PKM comparison replaces the original MLP.</td>
+              <td><code>FwPKM -> Attention/GatedDeltaNet</code></td>
+              <td>FwPKM is an online-updated episodic memory component. Its reported placement is before token mixing, not as an input embedding or Engram pre-attention residual branch in a standard Transformer block.</td>
+              <td><a href="good_papers/2601.00671-fast-weight-product-key-memory.pdf">FwPKM</a>: <span class="snippet">"inserted before the token mixer"</span></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="note">
+          <b>Practical reading:</b> if the design is <b>per-layer embedding</b>, look inside the FFN/SwiGLU path. If the design is <b>Engram-style</b>, look for a residual memory branch at selected blocks before normal block computation. If the design is <b>PKM/Memory Layers/Hash Layers</b>, look for FFN replacement. If the design is <b>Memorizing Transformer/MoC</b>, look in attention or cross-attention.
+        </div>
+      </section>
+
+      <section>
+        <h2>Architecture Families</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Family</th>
+              <th>Neural placement</th>
+              <th>Addressing</th>
+              <th>Fusion into model</th>
+              <th>Source snippet</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>PLE / STEM</b></td>
+              <td>Selected decoder FFN layers; replaces or adds to the SwiGLU up-projection side.</td>
+              <td>Token ID selects a row from the embedding table owned by that same layer.</td>
+              <td>In STEM, the selected row takes the normal up/value-projection position inside the FFN; the hidden-state gate and down projection remain. PLE variants may be additional or lower-dimensional.</td>
+              <td><a href="good_papers/STEM_Scaling_Transformers_with_Embedding_Modules.pdf">STEM</a>: <span class="snippet">"replaces the FFN up-projection"</span></td>
+            </tr>
+            <tr>
+              <td><b>LongCat PLE / PLNE</b></td>
+              <td>MLP within dense sub-layer of shortcut layers.</td>
+              <td>PLE uses layer embedding table; PLNE uses per-layer n-gram embedding output.</td>
+              <td>Embedding output substitutes the up-projection output inside SwiGLU multiplication.</td>
+              <td><a href="good_papers/Scaling_Embeddings_Outperforms_Scaling_Experts.pdf">LongCat</a>: <span class="snippet">"layer-specific embedding table and projection matrix"</span></td>
+            </tr>
+            <tr>
+              <td><b>Over-Encoding / N-gram input embedding</b></td>
+              <td>Input embedding module, not an internal per-layer memory branch.</td>
+              <td>Base token IDs form hashed n-gram IDs; rows are looked up from large n-gram tables.</td>
+              <td>Base embedding plus projected n-gram embeddings forms the token representation.</td>
+              <td><a href="good_papers/2501.16975-over-tokenized-transformer-vocabulary-worth-scaling.pdf">Over-Tokenized Transformer</a>: <span class="snippet">"sum of 1-, 2-, ..., n-gram embeddings"</span></td>
+            </tr>
+            <tr>
+              <td><b>DeepSeek Engram</b></td>
+              <td>Only specific Transformer layers; paper examples include layers 2 and 15 in the large-scale setup.</td>
+              <td>Compressed suffix n-grams, multi-head multiplicative-XOR hashes, prime-sized tables.</td>
+              <td>Retrieved memory -> key/value projections -> scalar hidden-state gate -> short depthwise causal conv -> residual add.</td>
+              <td><a href="good_papers/2601.07372-conditional-memory-scalable-lookup-engram.pdf">Engram</a>: <span class="snippet">"retrieving static N-gram memory"</span></td>
+            </tr>
+            <tr>
+              <td><b>TN-gram</b></td>
+              <td>Same selected Transformer-block interface as Engram.</td>
+              <td>Replaces per-order/per-head hash tables with CP tensor factors shared across n-gram orders.</td>
+              <td>Produces key/value through projection absorption, then follows Engram-style gate/conv/residual.</td>
+              <td><a href="good_papers/2606.08347-tensorizing-engram-tn-gram.pdf">TN-gram</a>: <span class="snippet">"shared CP tensorized memory"</span></td>
+            </tr>
+            <tr>
+              <td><b>Memory Grafting</b></td>
+              <td>Recipient Transformer grafting layers; same residual-memory write interface as Engram.</td>
+              <td>Exact longest-match suffix lookup into frozen grafted memory; hash Engram fallback on misses.</td>
+              <td>Selected frozen or hash memory -> separate projections -> context gate -> ShortConv -> residual update.</td>
+              <td><a href="good_papers/2605.20948-memory-grafting-offline-conditional-memory.pdf">Memory Grafting</a>: <span class="snippet">"exact longest-match suffix lookup"</span></td>
+            </tr>
+            <tr>
+              <td><b>Memory Layers at Scale</b></td>
+              <td>Replace one or more FFN layers; Memory+ uses three centered layers in reported setup.</td>
+              <td>Hidden state query selects trainable key/value entries by top-k similarity.</td>
+              <td>Weighted value sum, optionally with projection, gating, and SiLU nonlinearity.</td>
+              <td><a href="good_papers/Memory_Layers_at_Scale_Meta_FAIR.pdf">Memory Layers</a>: <span class="snippet">"top-k most similar keys"</span></td>
+            </tr>
+            <tr>
+              <td><b>Product-Key Memory</b></td>
+              <td>Replace selected FFN blocks or interleave memory between blocks.</td>
+              <td>Query is split into sub-queries; product keys make exact nearest-key search efficient.</td>
+              <td>Softmax over selected values; multi-head PKM sums independent memory-head outputs.</td>
+              <td><a href="good_papers/1907.05242-large-memory-layers-with-product-keys.pdf">PKM</a>: <span class="snippet">"product key memory layer"</span></td>
+            </tr>
+            <tr>
+              <td><b>Hash Layers</b></td>
+              <td>Replace one or more Transformer FFN sublayers with hash-routed expert FFNs.</td>
+              <td>Original input token, not hidden state, is hashed to a fixed expert bucket.</td>
+              <td>Selected expert FFN processes the hidden state; no learned router.</td>
+              <td><a href="good_papers/2106.04426-hash-layers-for-large-sparse-models.pdf">Hash Layers</a>: <span class="snippet">"fixed mapping to experts"</span></td>
+            </tr>
+            <tr>
+              <td><b>Memorizing Transformer</b></td>
+              <td>One attention layer near top of stack.</td>
+              <td>Approximate kNN over external cache of prior key/value pairs.</td>
+              <td>Local attention and kNN-memory attention are combined by a learned per-head gate.</td>
+              <td><a href="good_papers/2203.08913-memorizing-transformers.pdf">Memorizing Transformer</a>: <span class="snippet">"approximate k-nearest-neighbor search"</span></td>
+            </tr>
+            <tr>
+              <td><b>Mixture of Chapters</b></td>
+              <td>Memory cross-attention layers inserted into decoder blocks.</td>
+              <td>Sequence-level router selects top-k chapters from a learned latent-token bank.</td>
+              <td>Token stream queries selected memory tokens through cross-attention, then residual add.</td>
+              <td><a href="good_papers/Mixture_of_Chapters_Scaling_Learnt_Memory_in_Transformers.pdf">MoC</a>: <span class="snippet">"learned bank of latent tokens"</span></td>
+            </tr>
+            <tr>
+              <td><b>FwPKM</b></td>
+              <td>Inserted before token mixer; standard PKM baseline replaces MLP.</td>
+              <td>Product-key sparse retrieval with fast-weight key/value matrices updated online.</td>
+              <td>Retrieved value interpolates with residual value path via gate, then output projection.</td>
+              <td><a href="good_papers/2601.00671-fast-weight-product-key-memory.pdf">FwPKM</a>: <span class="snippet">"sparse fast-weight memory layer"</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Per-Layer Embedding</h2>
+        <div class="split">
+          <div>
+            <h3>1. PLE as modulation/additional block</h3>
+            <p>STEM describes PLE as sharing FFN gate and down projections while adding token-level specificity. It also says PLE does not remove the original FFN in each decoder layer. Therefore, the source-backed architecture is not a standalone replacement for the whole FFN; it is a token-indexed sparse parametric memory path coupled to the FFN path.</p>
+            <p><b>Source boundary:</b> the specific Google Gemma 3n PLE implementation is referenced by STEM and LongCat, but the local corpus does not contain an official Gemma technical spec for PLE. The notes here therefore rely on STEM/LongCat descriptions, not on a proprietary reverse engineering claim.</p>
+
+            <h3>2. STEM as up-projection replacement</h3>
+            <p>STEM makes the neural location explicit. For layer <code>l</code>, table <code>U_l</code> has shape <code>V x d_ff</code>: <code>V</code> rows for the vocabulary and <code>d_ff</code> columns to match the FFN intermediate width. The token row <code>U_l[t]</code> means "use token ID <code>t</code> to select one row from layer <code>l</code>'s table."</p>
+            <div class="diagram">At layer l, for one token position
+  hidden vector x_l
+    -> Wg_l gate projection
+    -> SiLU activation
+    -> context-dependent FFN-width gate vector
+
+  token ID t
+    -> lookup in table U_l
+    -> FFN-width token row U_l[t]
+
+  gate vector * token row
+    -> Wd_l down projection
+    -> model-width FFN output for the residual stream</div>
+            <p>So the architecture is not "put another embedding at the input." The lookup row is inserted inside the layer's FFN, in the same slot where the normal SwiGLU up/value branch would have produced <code>Wu_l x_l</code>.</p>
+            <p>The reason given in STEM is architectural: replacing the gate projection makes selection too context-independent, while replacing the up projection preserves hidden-state-dependent gating.</p>
+          </div>
+          <div class="card">
+            <h3>Evidence</h3>
+            <p><a href="good_papers/STEM_Scaling_Transformers_with_Embedding_Modules.pdf">STEM</a> says PLE tables are in node-local CPU memory and prefetched, then proposes STEM as a stricter design with one per-layer table <code>U_l</code>.</p>
+            <p>Snippet: <span class="snippet">"layer-local embedding lookup"</span></p>
+            <p><a href="good_papers/Scaling_Embeddings_Outperforms_Scaling_Experts.pdf">LongCat</a> uses the same FFN placement: its PLE notation <code>E0_l(t_i)</code> is a layer-specific token row, and PLNE changes that value source to an n-gram embedding output <code>e_i_l</code>.</p>
+            <p>Snippet: <span class="snippet">"Per-Layer N-gram Embedding"</span></p>
+            <p class="small">Not stated in the local PLE descriptions: a universal rule for which layers must receive PLE, whether tables should always be shared across devices, or a final optimal PLE-vs-PLNE allocation.</p>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Engram Block</h2>
+        <p>DeepSeek Engram is an added residual branch at selected Transformer layers. It is not simply a bigger input embedding and it is not a learned router to experts. Its paper describes two phases: retrieval and fusion.</p>
+        <div class="diagram">token ids
+  -> tokenizer compression
+  -> suffix n-grams for n = 2..N
+  -> K hash heads per n-gram order
+  -> per-order/per-head embedding rows
+  -> concatenate retrieved rows into e_t
+  -> k_t = W_K e_t, v_t = W_V e_t
+  -> alpha_t = sigmoid(norm(h_t) dot norm(k_t) / sqrt(d))
+  -> gated value = alpha_t * v_t
+  -> ShortConv(gated value)
+  -> H_l = H_l + memory_output
+  -> then standard Attention and MoE in the demo/reference block</div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Part</th>
+              <th>Source-backed detail</th>
+              <th>Do not infer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Tokenizer compression</td>
+              <td>Raw token IDs are projected to canonical IDs before forming suffix n-grams.</td>
+              <td>Do not assume every Engram variant keeps compression; the vision diagnostic explicitly does not.</td>
+            </tr>
+            <tr>
+              <td>N-gram orders</td>
+              <td>Large-scale Engram uses <code>[2,3]</code>; reference ablations also use <code>{2,3}</code>.</td>
+              <td>Do not assume higher orders are always better; TN-gram reports most gains by 5-gram in its setup, but that is a different parameterization.</td>
+            </tr>
+            <tr>
+              <td>Hash heads</td>
+              <td>Engram-27B/40B table lists 8 heads, memory dim 1280, layers <code>[2,15]</code>.</td>
+              <td>Do not assume 8 heads is universal; image Engram uses H=4.</td>
+            </tr>
+            <tr>
+              <td>Fusion</td>
+              <td>Current hidden state is the query for a scalar gate over retrieved memory, followed by short depthwise causal convolution and residual add.</td>
+              <td>Do not call this attention over the table; the table address is deterministic, and the gate controls write strength after retrieval.</td>
+            </tr>
+            <tr>
+              <td>mHC / multi-branch</td>
+              <td>Paper shares sparse embedding table and value projection across branches, but uses distinct key projections for branch-specific gates.</td>
+              <td>Do not apply mHC details to a single-stream backbone unless the backbone has those residual branches.</td>
+            </tr>
+            <tr>
+              <td>Placement</td>
+              <td>DeepSeek reports layers 2 and 15 in the large model; ablation says layer 2 is best for single insertion, and layers 2 and 6 improve over one module in a 12-layer setup.</td>
+              <td>Do not infer all layers should have Engram. The source says <span class="snippet">"applied only to specific layers"</span>.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Engram Variants</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Variant</th>
+              <th>What changes</th>
+              <th>What stays Engram-like</th>
+              <th>Evidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>TN-gram</b></td>
+              <td>Independent hash tables are replaced by CP tensor factors shared across n-gram orders. Lower-order n-grams are derived from the largest-order tensor using order-absorption vectors.</td>
+              <td>Suffix n-gram extraction, selected Transformer blocks, key/value projections, hidden-state gate, depthwise causal conv, residual add.</td>
+              <td><a href="good_papers/2606.08347-tensorizing-engram-tn-gram.pdf">TN-gram</a>: <span class="snippet">"same Engram context-aware gating"</span></td>
+            </tr>
+            <tr>
+              <td><b>Memory Grafting</b></td>
+              <td>Frequent n-gram values are frozen hidden states from an offline grafting model; runtime uses exact longest-match lookup before falling back to hash Engram.</td>
+              <td>Selected memory is projected to key/value, gated against recipient hidden state, passed through ShortConv, and added to the residual stream.</td>
+              <td><a href="good_papers/2605.20948-memory-grafting-offline-conditional-memory.pdf">Memory Grafting</a>: <span class="snippet">"hash-based Engram fallback"</span></td>
+            </tr>
+            <tr>
+              <td><b>Vision Engram diagnostic</b></td>
+              <td>Uses 2D spatial n-gram hashing over image-token grids, no tokenizer compression, and placements at layers <code>{0,6,12,18}</code> in the reported AR image model.</td>
+              <td>Still uses hash-keyed memory, gated fusion, and residual side path.</td>
+              <td><a href="good_papers/2605.13179-does-engram-do-memory-retrieval-ar-image-generation.pdf">Image diagnostic</a>: <span class="snippet">"gated architectural side-pathway"</span></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="note">
+          <b>Important caveat:</b> the AR image paper is negative for a strict retrieval interpretation. It says the module is better described as <span class="snippet">"not as a content-addressed retriever"</span> in that setting. That does not refute the LLM Engram architecture, but it does mean architecture-level lookup should not be equated with verified semantic retrieval without task-specific probes.
+        </div>
+      </section>
+
+      <section>
+        <h2>Related Designs</h2>
+        <p>These papers are relevant because they specify alternate ways to insert sparse memory into a neural network. They are not the same architecture as Engram or PLE.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Design</th>
+              <th>Architecture</th>
+              <th>Why it is not Engram/PLE</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>Hash Embeddings</b></td>
+              <td>Multiple hash functions select component vectors; learned importance weights combine them.</td>
+              <td>It is an embedding compression/composition method, not a Transformer residual memory branch. Snippet from <a href="good_papers/1709.03933-hash-embeddings-efficient-word-representations.pdf">Hash Embeddings</a>: <span class="snippet">"weighted sum"</span></td>
+            </tr>
+            <tr>
+              <td><b>spaCy multi-hash embeddings</b></td>
+              <td>Production NLP embedding stack uses multiple hashes into vector tables for compact lexical feature embeddings.</td>
+              <td>It backs the multi-hash primitive, but not per-layer Transformer memory. Snippet from <a href="good_papers/2212.09255-multi-hash-embeddings-in-spacy.pdf">spaCy report</a>: <span class="snippet">"hashed multiple times"</span></td>
+            </tr>
+            <tr>
+              <td><b>Probabilistic Hash Embeddings</b></td>
+              <td>Hash embedding rows are probabilistic variables with Bayesian online posterior updates for changing categorical vocabularies.</td>
+              <td>It is a plug-in embedding module for online categorical features, not an LLM per-layer memory branch. Snippet from <a href="good_papers/2511.20893-probabilistic-hash-embeddings-online-categorical-features.pdf">PHE</a>: <span class="snippet">"hash embeddings as random variables"</span></td>
+            </tr>
+            <tr>
+              <td><b>Memory+ / Memory Layers at Scale</b></td>
+              <td>Trainable key/value memory replaces FFN layers. Memory+ adds projection, gating, and SiLU.</td>
+              <td>Addressing is hidden-state top-k over learned keys, not token-ID n-gram hashing.</td>
+            </tr>
+            <tr>
+              <td><b>PKM</b></td>
+              <td>Query network produces query; product-key search selects values; multi-head PKM uses independent query networks and shared values.</td>
+              <td>It usually replaces FFN blocks, whereas Engram is an added n-gram memory branch.</td>
+            </tr>
+            <tr>
+              <td><b>MoC</b></td>
+              <td>Sequence-level router picks chapters of a learned latent-token memory bank, then cross-attention reads selected chapters.</td>
+              <td>It is routed cross-attention over memory tokens, not deterministic n-gram lookup.</td>
+            </tr>
+            <tr>
+              <td><b>Memorizing Transformer</b></td>
+              <td>A near-top attention layer augments local attention with kNN attention over a non-differentiable external cache.</td>
+              <td>It stores prior activations per document; Engram stores trainable or frozen n-gram-addressed embeddings.</td>
+            </tr>
+            <tr>
+              <td><b>Hash Layers</b></td>
+              <td>Original token is hashed to a fixed expert FFN bucket; multi-hash layers split FFN parameters into hashed segments.</td>
+              <td>It routes computation to expert FFNs; Engram retrieves memory rows and gates a residual value.</td>
+            </tr>
+            <tr>
+              <td><b>FwPKM</b></td>
+              <td>Fast-weight product-key memory retrieves sparse slots and updates key/value rows by chunk-level local gradient objectives during training and inference.</td>
+              <td>It is online episodic memory, not static n-gram conditional memory.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Deployment Consequences</h2>
+        <p>The CXL paper is not a new neural block. It is evidence that Engram's deterministic address path changes where memory can live.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Consequence</th>
+              <th>Source-backed detail</th>
+              <th>Architecture relevance</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Prefetchability</td>
+              <td>Engram indices depend on token IDs, so retrieval can start before hidden states at the target layer exist.</td>
+              <td>Supports placing massive tables outside GPU HBM if latency can be hidden.</td>
+            </tr>
+            <tr>
+              <td>Sparse payload</td>
+              <td>The CXL paper's case study reports <span class="snippet">"5 KB of data per token per layer"</span>.</td>
+              <td>Bandwidth can be modest, but early-layer latency windows can be tight.</td>
+            </tr>
+            <tr>
+              <td>System architecture</td>
+              <td>CXL pool stores Engram parameters centrally and workers fetch rows during forward pass.</td>
+              <td>This changes serving infrastructure, not the mathematical Engram block.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Concrete Defaults Actually Reported</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Paper</th>
+              <th>Reported architecture numbers</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>DeepSeek Engram</td>
+              <td>Engram-27B/40B: memory dim 1280, vocab sizes 2,262,400 / 7,239,680, 8 heads, layers <code>[2,15]</code>, n-gram <code>[2,3]</code>, tokenizer compression true, conv zero-init true.</td>
+              <td><span class="ok">direct table in appendix</span></td>
+            </tr>
+            <tr>
+              <td>Engram ablation</td>
+              <td>12-layer 3B MoE reference: 1.6B Engram memory, <code>{2,3}</code>-grams, inserted at layers 2 and 6; layer-2 best in single-layer sweep.</td>
+              <td><span class="ok">direct ablation text</span></td>
+            </tr>
+            <tr>
+              <td>STEM</td>
+              <td>Default experiments replace one third of FFN layers at uniform intervals; dense up-projection replaced by <code>V x d_ff</code> embedding table in each replaced layer.</td>
+              <td><span class="ok">direct setup text</span></td>
+            </tr>
+            <tr>
+              <td>LongCat-Flash-Lite</td>
+              <td>14 shortcut layers; MoE has 256 FFN experts and 128 zero-experts; token selects 12 experts; embedding module has 31.4B n-gram embedding parameters, 46% of total.</td>
+              <td><span class="ok">direct model-info text</span></td>
+            </tr>
+            <tr>
+              <td>Memory Grafting</td>
+              <td>0.92B / 2.8B class tables list n-gram <code>[2,3]</code>, 8 heads, Engram target layers <code>[1,6]</code> or <code>[1,12]</code>, grafting recipient layers <code>[1,12]</code>, 3M entries per grafted layer, frozen memory.</td>
+              <td><span class="ok">direct appendix tables</span></td>
+            </tr>
+            <tr>
+              <td>MoC</td>
+              <td>16-layer decoder; memory cross-attention at layers <code>{2,6,10,14}</code>; 262,208 latent memory tokens shared across memory layers; 4,097 chapters; top-k 64 chapters per sequence.</td>
+              <td><span class="ok">direct architecture table</span></td>
+            </tr>
+            <tr>
+              <td>FwPKM</td>
+              <td>12-layer models; PKM/FwPKM at layers 2, 6, 10; PKM retrieves Top-128 slots; FwPKM retrieves Top-8 slots.</td>
+              <td><span class="ok">direct training setup</span></td>
+            </tr>
+            <tr>
+              <td>PLE official production details</td>
+              <td>Exact proprietary layer list, storage protocol, and table shapes for Gemma 3n PLE are not contained in the local paper corpus.</td>
+              <td><span class="no">not stated here</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Source Index</h2>
+        <ul class="source-list">
+          <li><a href="good_papers/2601.07372-conditional-memory-scalable-lookup-engram.pdf">Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models</a></li>
+          <li><a href="good_references/engram_demo_v1.py">Official Engram demo implementation</a> and <a href="good_references/engram_official_README.md">official README</a></li>
+          <li><a href="good_papers/STEM_Scaling_Transformers_with_Embedding_Modules.pdf">STEM: Scaling Transformers with Embedding Modules</a></li>
+          <li><a href="good_papers/Scaling_Embeddings_Outperforms_Scaling_Experts.pdf">Scaling Embeddings Outperforms Scaling Experts in Language Models</a></li>
+          <li><a href="good_papers/2501.16975-over-tokenized-transformer-vocabulary-worth-scaling.pdf">Over-Tokenized Transformer: Vocabulary is Generally Worth Scaling</a></li>
+          <li><a href="good_papers/2606.08347-tensorizing-engram-tn-gram.pdf">Tensorizing Engram: Sharing Latents Across N-Gram Embeddings is Beneficial</a></li>
+          <li><a href="good_papers/2605.20948-memory-grafting-offline-conditional-memory.pdf">Memory Grafting: Scaling Language Model Pre-training via Offline Conditional Memory</a></li>
+          <li><a href="good_papers/2605.13179-does-engram-do-memory-retrieval-ar-image-generation.pdf">Does Engram Do Memory Retrieval in Autoregressive Image Generation?</a></li>
+          <li><a href="good_papers/2603.10087-pooling-engram-conditional-memory-cxl.pdf">Pooling Engram Conditional Memory in Large Language Models using CXL</a></li>
+          <li><a href="good_papers/Memory_Layers_at_Scale_Meta_FAIR.pdf">Memory Layers at Scale</a></li>
+          <li><a href="good_papers/1907.05242-large-memory-layers-with-product-keys.pdf">Large Memory Layers with Product Keys</a></li>
+          <li><a href="good_papers/Mixture_of_Chapters_Scaling_Learnt_Memory_in_Transformers.pdf">Mixture of Chapters: Scaling Learnt Memory in Transformers</a></li>
+          <li><a href="good_papers/2203.08913-memorizing-transformers.pdf">Memorizing Transformers</a></li>
+          <li><a href="good_papers/2106.04426-hash-layers-for-large-sparse-models.pdf">Hash Layers for Large Sparse Models</a></li>
+          <li><a href="good_papers/1709.03933-hash-embeddings-efficient-word-representations.pdf">Hash Embeddings for Efficient Word Representations</a></li>
+          <li><a href="good_papers/2212.09255-multi-hash-embeddings-in-spacy.pdf">Multi-hash embeddings in spaCy</a></li>
+          <li><a href="good_papers/2511.20893-probabilistic-hash-embeddings-online-categorical-features.pdf">Probabilistic Hash Embeddings for Online Learning of Categorical Features</a></li>
+          <li><a href="good_papers/2601.00671-fast-weight-product-key-memory.pdf">Fast-weight Product Key Memory</a></li>
+        </ul>
+        <p class="small">Papers in <code>good_papers/</code> that are less central to this architecture note were still treated as part of the reviewed corpus when deciding scope. The HTML emphasizes papers that specify actual neural block placement, addressing, and fusion.</p>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
