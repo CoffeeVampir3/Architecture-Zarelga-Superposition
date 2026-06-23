@@ -158,6 +158,10 @@ def load_and_preprocess_data(data_dir="outputs", max_length=ModelConfig.sequence
 # TLDR is that this does a direct update (not via backward) to the expert biases which will tip towards underfilled experts.
 # `update_rate` is the bias-update speed (DeepSeek-V3's gamma). It is the *only* load-balancing
 # force here, so it must be strong enough to overcome routing drift: V3 uses 1e-3 (see train()).
+# Unlike V3's magnitude-blind sign() step, we scale each step by the expert's *relative* load
+# deviation (LongCat-Flash, arXiv:2509.01322, Eq. 2): severely imbalanced experts -- e.g. the
+# token-identity-dominated early layers -- get large corrections, while near-balanced experts get
+# vanishingly small ones, so the bias settles instead of dithering around the target.
 def auxillary_loss_free_update(model, all_topk_indices, update_rate, attention_mask=None):
     valid_tokens = attention_mask.bool() if attention_mask is not None else None
 
@@ -171,8 +175,12 @@ def auxillary_loss_free_update(model, all_topk_indices, update_rate, attention_m
 
             gate = model.layers[layer_idx].mlp.gate
             expert_counts = torch.bincount(topk_idx.flatten(), minlength=gate.n_routed_experts).float()
-            errors = expert_counts.mean() - expert_counts
-            gate.expert_biases.add_(update_rate * torch.sign(errors))
+            # Relative load deviation in [1 - n_experts, 1]: 0 at the expected load, +1 for a fully
+            # starved expert, large-negative for a hot one. At full imbalance this matches the old
+            # +/-update_rate step, so update_rate stays calibrated.
+            expected_load = expert_counts.mean()
+            relative_error = (expected_load - expert_counts) / expected_load
+            gate.expert_biases.add_(update_rate * relative_error)
 
 def build_next_token_loss_inputs(embeddings, input_ids, attention_mask, loss_mask=None, ignore_index=-100):
     source_mask = attention_mask[:, :-1].bool()
@@ -586,6 +594,7 @@ def train(
     muon_lr=0.02,
     adam_lr=3e-4,
     update_rate=1e-3,
+    update_rate_floor_ratio=0.1,
     embedding_weight_decay=0.1,
     checkpoint_interval_steps=10_000,
     max_rolling_checkpoints=5,
@@ -644,6 +653,8 @@ def train(
         'num_epochs': num_epochs,
         'sequence_length': sequence_length,
         'update_rate': update_rate,
+        'update_rate_floor_ratio': update_rate_floor_ratio,
+        'update_rate_schedule': 'linear_decay_to_floor',
         'optimizer': 'SingleDeviceMuonMDWithAuxAdam (capturable / CUDA-graph)',
         'optimizer_momentum': muon_momentum,
         'optimizer_gain_lr': gain_lr,
@@ -812,7 +823,13 @@ def train(
         entropy_floor_value = entropy_floor.item()
         loss_normalizer_value = loss_normalizer.item()
         total_loss += loss_value
-        auxillary_loss_free_update(model, all_topk_indices, update_rate, attention_mask)
+        # Decay the bias-update rate over training (LongCat-Flash: "a decay schedule for mu
+        # improves the stability of budget control"). Linear from update_rate down to a floor
+        # (update_rate_floor_ratio of the initial value) so the router is perturbed less as
+        # routing converges, while retaining enough force to correct late-training drift. `t`
+        # is the normalized training progress in [0, 1] computed at the top of the loop.
+        current_update_rate = update_rate * (1.0 - (1.0 - update_rate_floor_ratio) * t)
+        auxillary_loss_free_update(model, all_topk_indices, current_update_rate, attention_mask)
 
         step_idx += s
         optimizer_step_count += 1
@@ -845,7 +862,7 @@ def train(
         )
 
         epoch = step_idx // max(1, len(train_loader))
-        metrics = logger.log_training_metrics(loss, optimizer, update_rate)
+        metrics = logger.log_training_metrics(loss, optimizer, current_update_rate)
         metrics.update(logger.log_moe_metrics(all_topk_indices, global_step, attention_mask))
         metrics["loss/entropy_floor"] = entropy_floor_value
         metrics["loss/reducible_gap"] = loss_normalizer_value

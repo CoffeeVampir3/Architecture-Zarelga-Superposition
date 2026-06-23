@@ -125,19 +125,10 @@ class AimLogger:
             total_tokens = topk_idx.numel()
             n_experts = gate.n_routed_experts
 
-            experts_used = (expert_counts > 0).sum().item()
-            pct_experts_used = 100.0 * experts_used / n_experts
-
             expected_load = total_tokens / n_experts
             load_balance = ((expert_counts.float() / expected_load - 1.0).abs().mean()).item()
 
-            max_expert_pct = (expert_counts.max().float() * 100.0 / total_tokens).item()
-            min_expert_pct = (expert_counts.min().float() * 100.0 / total_tokens).item()
-
-            metrics[f'experts/layer_{layer_idx}_pct_experts_used'] = pct_experts_used
             metrics[f'experts/layer_{layer_idx}_load_imbalance'] = load_balance
-            metrics[f'experts/layer_{layer_idx}_max_expert_pct'] = max_expert_pct
-            metrics[f'experts/layer_{layer_idx}_min_expert_pct'] = min_expert_pct
 
         return metrics
 
@@ -160,13 +151,11 @@ class AimLogger:
             memory each step exercises. Read off engram.embedding.weight.grad, which
             still holds this backward's sparse grad until the next zero_grad.
           * rows_activated_frac -- the same as a fraction of total rows.
-          * alpha_abs_mean      -- mean |LayerScale|, i.e. how hard the model gates the
-            memory residual in (alpha->0 means the branch is being ignored).
 
         Detailed-cadence signals (full-table reductions / distributions):
           * grad_row_norm_mean  -- mean per-row grad norm of touched rows (the learning
             signal flowing into memory; the generic stats skip sparse grads).
-          * row_norm / alpha    -- distributions (heavy tail => a few hot n-grams).
+          * row_norm            -- distribution (heavy tail => a few hot n-grams).
 
         Note: a cumulative-occupancy metric was removed -- the table is tiny relative to
         the n-gram traffic (one step's lookups oversubscribe each head's rows), so it
@@ -192,9 +181,6 @@ class AimLogger:
                     g = coalesced.values()
                     metrics[f'{prefix}/grad_row_norm_mean'] = g.norm(dim=1).mean().item()
 
-            alpha = engram.alpha.detach()
-            metrics[f'{prefix}/alpha_abs_mean'] = alpha.abs().mean().item()
-
             # Importance weighting (a 2nd hash gating each head): the table is ones-init
             # (identity), so the signal is how far the touched weights have drifted from
             # 1.0 -- i.e. how much the model is up/down-weighting heads per n-gram.
@@ -214,7 +200,6 @@ class AimLogger:
                 written = row_norms[row_norms > 0]
                 if written.numel() > 0:
                     metrics[f'{prefix}/row_norm'] = written
-                metrics[f'{prefix}/alpha'] = alpha
 
         return metrics
 
@@ -311,6 +296,9 @@ class AimLogger:
             total_params += 1
 
             param_norm = param.detach().norm().item()
+            # Report engram tables' per-row RMS norm, not the row-count-dominated whole-tensor norm.
+            if layer_type == 'engram':
+                param_norm = param_norm / (param.shape[0] ** 0.5)
             param_mean = param.detach().mean().item()
             param_std = param.detach().std().item()
 
