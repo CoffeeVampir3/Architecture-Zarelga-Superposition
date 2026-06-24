@@ -1,26 +1,4 @@
-"""EngramEmbeddingSparse — Engram per-layer memory with a SPARSE-gradient table.
-
-Sparse counterpart of :class:`engram.prod.EngramEmbeddingDense`. Byte-for-byte
-identical except the table is built with ``nn.Embedding(..., sparse=True)``, so
-backward produces a COO sparse gradient (indices over the touched rows, values
-``[nnz, dim]``) instead of a full ``[n_rows, dim]`` dense grad. Pair with
-:class:`engram.prod.GramReaperSparse`, which consumes that sparse grad directly.
-
-Note: ``sparse=True`` restricts the table to optimizers that understand sparse
-gradients (GramReaperSparse, ``torch.optim.SparseAdam``, sparse SGD). The dense
-side-modules (``value_proj``, ``alpha``) keep dense grads and a normal optimizer.
-
-    h <- h + alpha * W_V( concat_heads  E[ address(token n-grams) ] )
-
-Addressing: suffix n-grams (orders 2,3) -> multiplicative-XOR mix with per-layer
-odd, overflow-safe multipliers -> mod a *distinct prime per head*. It depends only
-on token IDs, so the address is a fixed function computable before the forward pass.
-
-Usage:
-    cfg = EngramConfig(vocab_size=50257, d_model=768, layer_id=6)
-    engram = EngramEmbeddingSparse(cfg)
-    hidden = engram(hidden, token_ids)     # [B, T, d_model], [B, T]
-"""
+"""Sparse-gradient hashed n-gram memory."""
 
 from __future__ import annotations
 
@@ -84,10 +62,11 @@ class EngramConfig:
     layer_id: int = 0                  # per-layer seed (base_seed = seed + 10007*layer_id)
     seed: int = 0
     pad_id: int = 0                    # left-pad token for suffix n-grams
-    alpha_init: float = 0.1            # LayerScale init (alpha=0 -> identity)
-    importance_weighting: bool = False # per-head scalar weights from a 2nd hash (Svenstrup/spaCy)
-    head_norm: bool = False            # shrink-only per-head unit-ball projection (cap norm at 1; never amplify)
-    learned_gate: bool = True          # alpha is a trained LayerScale; False -> frozen at alpha_init (no learned gating)
+    alpha_init: float = 0.1
+    importance_weighting: bool = False
+    head_norm: bool = False
+    learned_gate: bool = True
+    table_dtype: torch.dtype = torch.bfloat16  # storage dtype for the hashed n-gram tables
 
     @property
     def heads_total(self) -> int:
@@ -109,7 +88,6 @@ class EngramEmbeddingSparse(nn.Module):
         self.max_order = max(self.orders)
         self.pad_id = int(config.pad_id)
 
-        # Per-layer odd, overflow-safe multipliers: token * multiplier never wraps int64.
         base_seed = config.seed + _PRIME_1 * config.layer_id
         g = torch.Generator().manual_seed(int(base_seed))
         m_max = _I64_MAX // int(config.vocab_size)
@@ -117,30 +95,20 @@ class EngramEmbeddingSparse(nn.Module):
         r = torch.randint(0, half, (self.max_order,), generator=g, dtype=torch.int64)
         self.register_buffer("multipliers", r * 2 + 1)
 
-        # Distinct prime modulus per (order, head); a single shared set across orders,
-        # so every head's modulus is globally unique (pairwise coprime -> decorrelated).
         seen: set[int] = set()
         head_sizes: list[int] = []
         for _ in self.orders:
             head_sizes.extend(_distinct_primes(int(config.rows_per_head), self.n_heads, seen))
         self.register_buffer("primes", torch.tensor(head_sizes, dtype=torch.int64))
 
-        # One shared embedding table addressed by per-head offsets.
         offsets = [0]
         for n in head_sizes[:-1]:
             offsets.append(offsets[-1] + n)
         self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.int64))
-        # SPARSE gradient: backward produces a COO grad over the touched rows only.
         self.embedding = nn.Embedding(sum(head_sizes), int(config.dim_per_head),
-                                      sparse=True)
+                                      sparse=True, dtype=config.table_dtype)
 
         self.value_proj = nn.Linear(config.engram_dim, config.d_model)
-        # Gate on the memory residual (per-channel LayerScale). When learned_gate is
-        # False the scale is frozen (registered as a buffer, no gradient) so the branch
-        # runs with NO learned gating -- an ablation knob. alpha_init sets the fixed
-        # magnitude: 1.0 removes the gate entirely (memory enters at full strength),
-        # 0.1 keeps the usual init scale but non-learned. Either way the branch is exactly
-        # identity at step 0 because the table is zero-init, so alpha * 0 == 0.
         self.learned_gate = bool(config.learned_gate)
         alpha = torch.full((config.d_model,), float(config.alpha_init))
         if self.learned_gate:
@@ -148,37 +116,23 @@ class EngramEmbeddingSparse(nn.Module):
         else:
             self.register_buffer("alpha", alpha)
 
-        # Zero-init the table: an un-trained row then contributes exactly nothing
-        # (value_proj(0)=bias) rather than noise that drowns a rare key's few trained
-        # heads. Measurably the best init tried (measurements/zipf_recall_lens.py).
         nn.init.zeros_(self.embedding.weight)
         nn.init.xavier_uniform_(self.value_proj.weight)
         nn.init.zeros_(self.value_proj.bias)
 
-        # Importance weighting: a SECOND, independent hash (different multipliers via
-        # base_seed+1) indexes a per-head scalar table (width 1), initialised to 1.0 so
-        # the layer starts identical to the no-importance baseline. Same sparse=True as
-        # the main table, so it rides the same sparse optimizer.
         self.head_norm = bool(config.head_norm)
         self.importance_weighting = bool(config.importance_weighting)
         if self.importance_weighting:
             gi = torch.Generator().manual_seed(int(base_seed) + 1)
             ri = torch.randint(0, half, (self.max_order,), generator=gi, dtype=torch.int64)
             self.register_buffer("imp_multipliers", ri * 2 + 1)
-            self.imp_table = nn.Embedding(sum(head_sizes), 1, sparse=True)
+            self.imp_table = nn.Embedding(sum(head_sizes), 1, sparse=True, dtype=config.table_dtype)
             nn.init.ones_(self.imp_table.weight)
 
     @torch.no_grad()
     def _addresses(self, token_ids: torch.Tensor, mult: torch.Tensor,
                    position_ids: torch.Tensor | None = None) -> torch.Tensor:
-        """``[B, T]`` token stream -> ``[B, T, heads_total]`` head-local indices for ``mult``.
-
-        When ``position_ids`` is given (per-segment indices that reset to 0 at each
-        packed-document boundary), the order-``k`` suffix shift is treated as a left-pad
-        wherever ``position_ids < k`` -- the k-th predecessor is in-document only where
-        ``position_ids >= k``, so the n-gram never reaches back into the previous packed
-        document. Without it, suffixes wrap across packed boundaries (contamination).
-        """
+        """``[B, T]`` token stream -> ``[B, T, heads_total]`` head-local indices."""
         token_ids = token_ids.to(torch.int64)
         b, t = token_ids.shape
         primes = self.primes
@@ -210,12 +164,7 @@ class EngramEmbeddingSparse(nn.Module):
     def forward(self, hidden_states: torch.Tensor,
                 token_ids: torch.Tensor,
                 position_ids: torch.Tensor | None = None) -> torch.Tensor:
-        """Add the memory contribution to the residual stream.
-
-        hidden_states: ``[B, T, d_model]``; token_ids: ``[B, T]``; position_ids:
-        ``[B, T]`` per-segment indices (optional; pass it on packed batches so suffix
-        n-grams don't cross document boundaries) -> ``[B, T, d_model]``.
-        """
+        """hidden_states: [B, T, d_model]; token_ids: [B, T] -> [B, T, d_model]."""
         addr = self.addresses(token_ids, position_ids) + self.offsets   # [B, T, H_total]
         e = self.embedding(addr)                                        # [B, T, H_total, dim]
         if self.importance_weighting:                                   # per-head scalar reweight

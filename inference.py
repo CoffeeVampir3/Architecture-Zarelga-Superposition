@@ -6,7 +6,7 @@ from safetensors.torch import load_file
 from transformers import PreTrainedTokenizerFast
 
 from modeling.model import MoEModel
-from model_variants import build_config
+from current_configuration import build_config
 
 
 ROOT = Path(__file__).resolve().parent
@@ -24,19 +24,20 @@ def load_tokenizer(tokenizer_path: Path):
 
 @torch.inference_mode()
 def generate(model, tokenizer, prompt: str, max_new_tokens: int, top_k: int = 5,
-             temperature: float = 0.0):
+             temperature: float = 0.0, device: str = "cuda"):
     input_ids = tokenizer.encode(prompt, add_special_tokens=False)
-    tokens = torch.tensor([input_ids], dtype=torch.long, device="cuda")
+    tokens = torch.tensor([input_ids], dtype=torch.long, device=device)
 
     sampling = temperature > 0.0
     mode = f"sampling T={temperature:g}" if sampling else "greedy (argmax)"
 
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
+
     for step in range(max_new_tokens):
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, _ = model(tokens)
 
         next_logits = logits[:, -1].float()
-        # Raw model distribution (T=1): this is what the printed "facts" describe.
         probs = torch.softmax(next_logits, dim=-1)
 
         if sampling:
@@ -108,6 +109,27 @@ def main():
         default=None,
         help="Random seed for reproducible sampling.",
     )
+    parser.add_argument(
+        "--cpu-offload",
+        action="store_true",
+        help=(
+            "Keep weights in CPU RAM and stream one module at a time onto the GPU "
+            "for the forward pass. The real flash-attn/Triton/scattermoe kernels still "
+            "run on CUDA (identical math); only ~one module's weights are GPU-resident, "
+            "so peak VRAM ~= the CUDA context + activations. Slow (re-copies weights "
+            "every token) but ideal for a smoke test while training holds most of VRAM."
+        ),
+    )
+    parser.add_argument(
+        "--max-mem-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Cap this process to a fraction of total VRAM (torch.cuda."
+            "set_per_process_memory_fraction) so a smoke test fails fast instead of "
+            "OOM-ing the live training run. E.g. 0.1 for 10%%."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.checkpoint.exists():
@@ -116,20 +138,29 @@ def main():
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
+    device = "cuda"
+
+    if args.max_mem_fraction is not None:
+        torch.cuda.set_per_process_memory_fraction(args.max_mem_fraction, 0)
+
     tokenizer = load_tokenizer(args.tokenizer)
-    # Same variant the trainer used (model_variants.py is the single source of truth),
-    # so the checkpoint's architecture -- Engram included -- matches by construction.
     config = build_config(len(tokenizer), tokenizer.pad_token_id)
 
-    model = MoEModel(config).cuda().eval()
-    state_dict = load_file(str(args.checkpoint), device="cuda")
+    load_device = "cpu" if args.cpu_offload else device
+
+    model = MoEModel(config).to(load_device).eval()
+    state_dict = load_file(str(args.checkpoint), device=load_device)
     tied = getattr(model, 'tie_word_embeddings', False)
     model.load_state_dict(state_dict, strict=not tied)
     if tied:
         model.tie_weights()
 
+    if args.cpu_offload:
+        from accelerate import cpu_offload
+        model = cpu_offload(model, execution_device=device, offload_buffers=False)
+
     print(generate(model, tokenizer, args.prompt, args.max_new_tokens,
-                   args.top_k, args.temperature))
+                   args.top_k, args.temperature, device))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,6 @@ Architecture:
 - Meituan Long Cat partial magnitude-corrected routing (For early layer routing imbalance) (LongCat-Flash technical report https://arxiv.org/html/2509.01322v1)
 - Zero Centered RMS Norm /w Weight Decay (Concept from Qwen3-Next: https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct)
 - Gated Attention (https://arxiv.org/abs/2505.06708)
-- Token superposition/Patch training (https://arxiv.org/pdf/2605.06546 / https://arxiv.org/abs/2407.12665)
 - Scattermoe (https://github.com/shawntan/scattermoe/tree/main)
 - Direction decoupled muon optimizer (https://haeggee.github.io/posts/magnitude-direction-decoupling)
 - Cut cross entropy training (https://arxiv.org/abs/2411.09009)
@@ -23,10 +22,10 @@ Train against pre-tokenized JSONL data under `outputs/` by default:
 uv run python main.py
 ```
 
-The default training run uses ordinary next-token cut cross entropy with
-partial positional RoPE. Token Superposition Training, S-RoPE, and the
-MCCE-backed multi-target loss are disabled on the normal `main.py` path; flip
-`set_superposition(..., enabled=True)` when running the A/B variant.
+The training run uses ordinary next-token cut cross entropy with partial
+positional RoPE. Documents are packed into a single flat, unpadded token stream
+(FlashAttention varlen via `cu_seqlens`), so the model runs on real tokens only —
+no padding is carried through the layer stack.
 
 Aim logs to: `logs/aim`
 ```

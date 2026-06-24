@@ -20,16 +20,12 @@ class MoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
 
-        # Deep seek style auxillary loss free routing:
-        # bias is added to the sigmoid score (s_{i,t} + b_i), per the V3 paper,
-        # not to the pre-sigmoid logit.
         gate_output = F.linear(hidden_states, self.weight, None)
         gate_probs = torch.sigmoid(gate_output)
 
         biased_scores = gate_probs + self.expert_biases
         _, topk_idx = torch.topk(biased_scores, k=self.top_k, dim=-1, sorted=False)
 
-        # Weight by the unbiased sigmoid probabilities.
         topk_weight = gate_probs.gather(-1, topk_idx)
         topk_weight = F.normalize(topk_weight, p=1, dim=-1)
 

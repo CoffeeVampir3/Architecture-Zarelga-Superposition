@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-from einops import rearrange
-from flash_attn.bert_padding import index_first_axis, pad_input
 
 from scattermoe.mlp import GLUMLP
 
@@ -25,9 +23,6 @@ class MoELayer(nn.Module):
             top_k=config.n_experts_per_token,
             activation=nn.SiLU(),
         )
-        # scattermoe's GLUMLP hardcodes a std=0.02 init; re-init at the config's
-        # 1/sqrt(d) so the routed-expert stacks match the paper's init (and so their
-        # frozen MuonMD sphere radii are correct).
         self.reset_routed_expert_parameters()
 
     def reset_routed_expert_parameters(self):
@@ -35,13 +30,8 @@ class MoELayer(nn.Module):
         nn.init.normal_(self.routed_experts.experts.weight, mean=0.0, std=std)
         nn.init.normal_(self.routed_experts.output_experts.weight, mean=0.0, std=std)
 
-    def forward(self, hidden_states, unpad_indices=None):
-        if unpad_indices is not None:
-            bsz, seq_len = hidden_states.shape[:2]
-            flat = rearrange(hidden_states, "b s d -> (b s) d")
-            x = index_first_axis(flat, unpad_indices).unsqueeze(0)
-        else:
-            x = hidden_states
+    def forward(self, hidden_states):
+        x = hidden_states
 
         topk_idx, topk_weight = self.gate(x)
         shared_output = self.shared_experts(x)
@@ -51,9 +41,5 @@ class MoELayer(nn.Module):
         routed_output = self.routed_experts(x, flat_topk_weight, flat_topk_idx)
 
         out = shared_output + routed_output
-
-        if unpad_indices is not None:
-            out = pad_input(out.squeeze(0), unpad_indices, bsz, seq_len)
-            topk_idx = pad_input(topk_idx.squeeze(0), unpad_indices, bsz, seq_len)
 
         return out, topk_idx

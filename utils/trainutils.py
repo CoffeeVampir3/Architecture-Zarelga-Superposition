@@ -113,8 +113,12 @@ class AimLogger:
 
         metrics = {}
         valid_tokens = attention_mask.bool() if attention_mask is not None else None
+        gates_by_layer = dict(self.moe_layers)
 
-        for (layer_idx, gate), topk_idx in zip(self.moe_layers, all_topk_indices):
+        for layer_idx, topk_idx in enumerate(all_topk_indices):
+            gate = gates_by_layer.get(layer_idx)
+            if topk_idx is None or gate is None:
+                continue
             if valid_tokens is not None:
                 topk_idx = topk_idx[valid_tokens]
 
@@ -143,24 +147,7 @@ class AimLogger:
             self.engrams.append((int(key), engram))
 
     def log_engram_metrics(self, step, detailed=False):
-        """Per-Engram memory diagnostics.
-
-        Cheap, every-step signals:
-          * rows_activated      -- unique table rows touched this step (nnz of the COO
-            grad). The table is addressed by hashed n-grams, so this is how much of the
-            memory each step exercises. Read off engram.embedding.weight.grad, which
-            still holds this backward's sparse grad until the next zero_grad.
-          * rows_activated_frac -- the same as a fraction of total rows.
-
-        Detailed-cadence signals (full-table reductions / distributions):
-          * grad_row_norm_mean  -- mean per-row grad norm of touched rows (the learning
-            signal flowing into memory; the generic stats skip sparse grads).
-          * row_norm            -- distribution (heavy tail => a few hot n-grams).
-
-        Note: a cumulative-occupancy metric was removed -- the table is tiny relative to
-        the n-gram traffic (one step's lookups oversubscribe each head's rows), so it
-        saturates to ~1.0 within a few steps and can't discriminate table sizes.
-        """
+        """Per-Engram memory diagnostics."""
         if not self.engrams:
             return {}
 
@@ -181,9 +168,6 @@ class AimLogger:
                     g = coalesced.values()
                     metrics[f'{prefix}/grad_row_norm_mean'] = g.norm(dim=1).mean().item()
 
-            # Importance weighting (a 2nd hash gating each head): the table is ones-init
-            # (identity), so the signal is how far the touched weights have drifted from
-            # 1.0 -- i.e. how much the model is up/down-weighting heads per n-gram.
             if detailed and getattr(engram, 'importance_weighting', False):
                 imp_weight = engram.imp_table.weight
                 imp_grad = imp_weight.grad
@@ -216,11 +200,7 @@ class AimLogger:
         layer_match = re.search(r'layers\.(\d+)', name)
         layer_num = int(layer_match.group(1)) if layer_match else -1
 
-        # Engram memory tables are named `engrams.<L>.embedding.weight`, so they'd
-        # otherwise fall into the 'embed' bucket below and pollute the token
-        # embedding's norm stats. They're intentionally not unit-norm constrained
-        # (associative-memory slots, not a normalized vocab matrix), so their
-        # unbounded growth is expected -- keep them on their own line.
+        # Engram memory tables are named `engrams.<L>.embedding.weight`.
         if 'engram' in name:
             layer_type = 'engram'
         elif 'mlp' in name or 'expert' in name:

@@ -37,9 +37,10 @@ def _triton_rope(
     n_qh: tl.constexpr,
     n_kh: tl.constexpr,
     hd: tl.constexpr,
+    rot_pairs: tl.constexpr,
     pad_n_qh: tl.constexpr,
     pad_n_kh: tl.constexpr,
-    pad_hd: tl.constexpr,
+    pad_rot: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BACKWARD_PASS: tl.constexpr = False,
 ):
@@ -75,18 +76,18 @@ def _triton_rope(
         batch_idx * (sl * k_sin_row_stride) + cos_row_idx * k_sin_row_stride,
     )
 
-    cos_offsets = tl.arange(0, pad_hd // 2)
-    cos_mask = cos_offsets < hd // 2
+    cos_offsets = tl.arange(0, pad_rot)
+    cos_mask = cos_offsets < rot_pairs
     q_cos_row = tl.load(q_cos + cos_offsets, mask=cos_mask, other=0)
     q_sin_row = tl.load(q_sin + cos_offsets, mask=cos_mask, other=0)
     k_cos_row = tl.load(k_cos + cos_offsets, mask=cos_mask, other=0)
     k_sin_row = tl.load(k_sin + cos_offsets, mask=cos_mask, other=0)
 
-    # Load left and right halves of q and k.
-    first_half_q_offsets = tl.arange(0, pad_n_qh)[:, None] * hd + tl.arange(0, pad_hd // 2)[None, :]
-    first_half_k_offsets = tl.arange(0, pad_n_kh)[:, None] * hd + tl.arange(0, pad_hd // 2)[None, :]
-    first_q_mask = (tl.arange(0, pad_n_qh)[:, None] < n_qh) & (tl.arange(0, pad_hd // 2)[None, :] < hd // 2)
-    first_k_mask = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (tl.arange(0, pad_hd // 2)[None, :] < hd // 2)
+    # Only the rotated band: pairs [0, rot_pairs) with [hd/2, hd/2 + rot_pairs); NoPE dims untouched.
+    first_half_q_offsets = tl.arange(0, pad_n_qh)[:, None] * hd + tl.arange(0, pad_rot)[None, :]
+    first_half_k_offsets = tl.arange(0, pad_n_kh)[:, None] * hd + tl.arange(0, pad_rot)[None, :]
+    first_q_mask = (tl.arange(0, pad_n_qh)[:, None] < n_qh) & (tl.arange(0, pad_rot)[None, :] < rot_pairs)
+    first_k_mask = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (tl.arange(0, pad_rot)[None, :] < rot_pairs)
     q_tile_1 = tl.load(q_ptr + first_half_q_offsets, mask=first_q_mask, other=0).to(q_sin_row.dtype)
     k_tile_1 = tl.load(k_ptr + first_half_k_offsets, mask=first_k_mask, other=0).to(k_sin_row.dtype)
 
@@ -122,7 +123,9 @@ def _triton_rope(
 def _launch(q, k, q_cos, q_sin, k_cos, k_sin, backward):
     batch_size, seq_len, n_q_head, head_dim = q.shape
     n_kv_head = k.shape[2]
-    pad_hd = triton.next_power_of_2(head_dim)
+    # Pairs to rotate == cos/sin band width; the rest of the head is NoPE (untouched).
+    rot_pairs = q_cos.shape[-1]
+    pad_rot = triton.next_power_of_2(rot_pairs)
     pad_n_q_head = triton.next_power_of_2(n_q_head)
     pad_n_kv_head = triton.next_power_of_2(n_kv_head)
     BLOCK_SIZE = max(pad_n_q_head, pad_n_kv_head)
@@ -161,9 +164,10 @@ def _launch(q, k, q_cos, q_sin, k_cos, k_sin, backward):
         n_q_head,
         n_kv_head,
         head_dim,
+        rot_pairs,
         pad_n_q_head,
         pad_n_kv_head,
-        pad_hd,
+        pad_rot,
         BLOCK_SIZE=BLOCK_SIZE,
         BACKWARD_PASS=backward,
     )

@@ -1,5 +1,4 @@
 from flash_attn import flash_attn_varlen_func
-from flash_attn.bert_padding import index_first_axis, pad_input
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -10,7 +9,6 @@ from .model_config import ModelConfig
 from .zRMSNorm import ZeroCenteredRMSNorm
 
 
-# https://arxiv.org/abs/2505.06708
 class GatedAttention(nn.Module):
     def __init__(self, config: ModelConfig, window_size: Optional[int] = None):
         super().__init__()
@@ -24,7 +22,6 @@ class GatedAttention(nn.Module):
         self.do_rope = config.do_rope
         self.initializer_range = config.initializer_range
 
-        # Sliding-window local attention. None => full causal attention.
         # flash_attn window is (left, right); a causal local span of W tokens
         # (current token + W-1 previous) maps to (W-1, 0). (-1, -1) disables it.
         self.window_size = window_size
@@ -43,9 +40,6 @@ class GatedAttention(nn.Module):
 
         self.head_gate_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
 
-        # QK-norm: per-head RMSNorm over head_dim, applied to Q and K before RoPE.
-        # Gain init == 1 (ZeroCenteredRMSNorm stores 1 + w with w init 0), so it is
-        # identity at init; the gains are 1-D and train under Adam.
         self.use_qk_norm = config.use_qk_norm
         if self.use_qk_norm:
             self.q_norm = ZeroCenteredRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -56,9 +50,6 @@ class GatedAttention(nn.Module):
 
         self.reset_parameters()
 
-        # Two-band rotation partition over head_dim:
-        #   pairs [0 .. pos_pairs)          : position-RoPE (symmetric Q+K)
-        #   pairs [pos_pairs .. head_dim/2) : NoPE (identity on both)
         self.pos_rope_dims = config.pos_rope_dims
         self.pos_rope_pairs = config.pos_rope_dims // 2
 
@@ -83,11 +74,7 @@ class GatedAttention(nn.Module):
         nn.init.normal_(self.head_gate_proj.weight, mean=0.0, std=self.initializer_range)
 
     def _build_pos_rope_tables(self, max_position_embeddings, head_dim, base, dtype, device):
-        """Position-RoPE cos/sin on the first `pos_rope_pairs` 2D pairs.
-
-        Tables are shaped [max_pos, head_dim/2]; identity (cos=1, sin=0) outside
-        the position band so the kernel's rotation on those pairs is a no-op.
-        """
+        """Build RoPE tables shaped [max_pos, head_dim / 2]."""
         half = head_dim // 2
         cos_table = torch.ones(max_position_embeddings, half, dtype=dtype, device=device)
         sin_table = torch.zeros(max_position_embeddings, half, dtype=dtype, device=device)
@@ -110,16 +97,10 @@ class GatedAttention(nn.Module):
         value_states: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
-        unpad_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz, seq_len = query_states.shape[:2]
 
         if cu_seqlens is None:
-            # No mask: every token in the (bsz, seq_len) grid is valid. Pack
-            # each batch row as its own sequence.
-            query_states = rearrange(query_states, "b s h d -> (b s) h d")
-            key_states = rearrange(key_states, "b s h d -> (b s) h d")
-            value_states = rearrange(value_states, "b s h d -> (b s) h d")
             cu_seqlens = torch.arange(
                 0,
                 (bsz + 1) * seq_len,
@@ -127,38 +108,16 @@ class GatedAttention(nn.Module):
                 dtype=torch.int32,
                 device=query_states.device,
             )
+            max_seqlen = seq_len
 
-            attn_output = flash_attn_varlen_func(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=seq_len,
-                max_seqlen_k=seq_len,
-                dropout_p=0.0,
-                causal=True,
-                window_size=self.window,
-            )
-            return rearrange(attn_output, "(b s) h d -> b s h d", b=bsz)
-
-        query_states = index_first_axis(
-            rearrange(query_states, "b s ... -> (b s) ..."),
-            unpad_indices,
-        )
-        key_states = index_first_axis(
-            rearrange(key_states, "b s ... -> (b s) ..."),
-            unpad_indices,
-        )
-        value_states = index_first_axis(
-            rearrange(value_states, "b s ... -> (b s) ..."),
-            unpad_indices,
-        )
+        q = rearrange(query_states, "b s h d -> (b s) h d")
+        k = rearrange(key_states, "b s h d -> (b s) h d")
+        v = rearrange(value_states, "b s h d -> (b s) h d")
 
         attn_output = flash_attn_varlen_func(
-            query_states,
-            key_states,
-            value_states,
+            q,
+            k,
+            v,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
@@ -167,7 +126,7 @@ class GatedAttention(nn.Module):
             causal=True,
             window_size=self.window,
         )
-        return pad_input(attn_output, unpad_indices, bsz, seq_len)
+        return rearrange(attn_output, "(b s) h d -> b s h d", b=bsz)
 
     def forward(
         self,
@@ -175,9 +134,7 @@ class GatedAttention(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
-        unpad_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # In B S (H D)
         bsz, seq_len, _ = hidden_states.size()
 
         if self.do_rope and position_ids is None:
@@ -192,15 +149,13 @@ class GatedAttention(nn.Module):
         key_states = rearrange(key_states, "b s (h d) -> b s h d", h=self.num_key_value_heads, d=self.head_dim)
         value_states = rearrange(value_states, "b s (h d) -> b s h d", h=self.num_key_value_heads, d=self.head_dim)
 
-        # QK-norm over head_dim (per head), before RoPE.
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
-        if self.do_rope:
-            # Symmetric position-RoPE: Q and K share the same cos/sin on the
-            # position band; the rest of head_dim is NoPE (identity in the table).
-            cos = self.pos_cos_cache[position_ids]   # [bsz, seq_len, head_dim/2]
-            sin = self.pos_sin_cache[position_ids]
+        if self.do_rope and self.pos_rope_pairs > 0:
+            # Pass only the position band (width pos_rope_pairs) to the kernel; NoPE dims untouched.
+            cos = self.pos_cos_cache[:, : self.pos_rope_pairs][position_ids]  # [bsz, seq, pos_rope_pairs]
+            sin = self.pos_sin_cache[:, : self.pos_rope_pairs][position_ids]
             query_states, key_states = LigerRopeFunction.apply(
                 query_states,
                 key_states,
@@ -216,7 +171,6 @@ class GatedAttention(nn.Module):
             value_states,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-            unpad_indices=unpad_indices,
         )
 
         gate_scores = torch.sigmoid(self.head_gate_proj(hidden_states))
