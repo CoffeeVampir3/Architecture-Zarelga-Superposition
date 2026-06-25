@@ -66,6 +66,7 @@ class EngramConfig:
     importance_weighting: bool = False
     head_norm: bool = False
     learned_gate: bool = True
+    forward_noise: bool = False                # Song-Ermon mode: perturb looked-up rows in-forward
     table_dtype: torch.dtype = torch.bfloat16  # storage dtype for the hashed n-gram tables
 
     @property

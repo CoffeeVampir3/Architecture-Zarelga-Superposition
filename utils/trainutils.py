@@ -91,7 +91,10 @@ class AimLogger:
     def __init__(self, repo='logs/aim', experiment='moe_training', enable_detailed_logging=True, detailed_frequency=10):
         self.repo_path = Path(repo)
         self.repo_path.mkdir(parents=True, exist_ok=True)
-        self.run = Run(repo=str(self.repo_path), experiment=experiment)
+        # system_tracking_interval=None disables Aim's automatic CPU/GPU/memory
+        # (non-network) system resource logging.
+        self.run = Run(repo=str(self.repo_path), experiment=experiment,
+                       system_tracking_interval=None)
         self.enable_detailed_logging = enable_detailed_logging
         self.detailed_frequency = detailed_frequency
         self.start_time = time.time()
@@ -162,7 +165,6 @@ class AimLogger:
                 coalesced = grad.coalesce()
                 idx = coalesced.indices()[0]
                 activated = idx.numel()
-                metrics[f'{prefix}/rows_activated'] = activated
                 metrics[f'{prefix}/rows_activated_frac'] = activated / total_rows
                 if detailed and activated > 0:
                     g = coalesced.values()
@@ -181,7 +183,8 @@ class AimLogger:
 
             if detailed:
                 row_norms = weight.detach().norm(dim=1)
-                written = row_norms[row_norms > 0]
+                written_mask = row_norms > 1e-6  # surviving rows (parameter-norm occupancy)
+                written = row_norms[written_mask]
                 if written.numel() > 0:
                     metrics[f'{prefix}/row_norm'] = written
 

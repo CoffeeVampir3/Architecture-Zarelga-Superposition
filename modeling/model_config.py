@@ -15,9 +15,24 @@ class EngramSettings:
     head_norm: bool = False
     learned_gate: bool = True
 
+    # Annealed memory-corruption noise (diffusion-style graduated optimization).
+    # Gaussian noise is added to the touched embedding-table rows in the sparse
+    # optimizer. `noise_std` is the per-row std *as a fraction of that row's norm*
+    # (rows are unit-normalized), so the noise/signal ratio is scale-invariant.
+    # The fraction decays from `noise_std` to exactly 0 over the first
+    # `noise_anneal_frac` of training. `noise_std == 0.0` disables the feature.
+    noise_std: float = 0.0
+    noise_anneal_frac: float = 0.5
+    noise_schedule: str = "cosine"          # "cosine" | "linear"
+    noise_layer_scale: tuple = ()           # per-layer multipliers aligned to `layers`; () = uniform
+
     @property
     def enabled(self) -> bool:
         return len(self.layers) > 0
+
+    @property
+    def noise_enabled(self) -> bool:
+        return self.enabled and self.noise_std > 0.0
 
     def __post_init__(self):
         if not self.enabled:
@@ -30,6 +45,17 @@ class EngramSettings:
             raise ValueError("engram dim_per_head must be positive.")
         if not self.orders or any(o < 2 for o in self.orders):
             raise ValueError("engram orders must be non-empty with each order >= 2.")
+        if self.noise_std < 0.0:
+            raise ValueError("engram noise_std must be non-negative.")
+        if not (0.0 < self.noise_anneal_frac <= 1.0):
+            raise ValueError("engram noise_anneal_frac must be in (0, 1].")
+        if self.noise_schedule not in ("cosine", "linear"):
+            raise ValueError("engram noise_schedule must be 'cosine' or 'linear'.")
+        if self.noise_layer_scale and len(self.noise_layer_scale) != len(self.layers):
+            raise ValueError(
+                "engram noise_layer_scale must be empty or match len(layers) "
+                f"({len(self.layers)}); got {len(self.noise_layer_scale)}."
+            )
 
 
 @dataclass

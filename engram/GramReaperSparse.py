@@ -23,6 +23,7 @@ class GramReaperSparse(Optimizer):
         for group in self.param_groups:
             lr, beta, eps = group["lr"], group["beta"], group["eps"]
             unit_norm = group["unit_norm"]
+            noise_std = group.get("noise_std", 0.0)  # annealed memory corruption (0 = off)
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -56,5 +57,14 @@ class GramReaperSparse(Optimizer):
                 row = p.data[idx].float() - step.unsqueeze(1) * g
                 if unit_norm:
                     row = row / row.norm(dim=1, keepdim=True).clamp_min(eps)
+                if noise_std > 0.0:
+                    # Relative corruption: per-row std is `noise_std` *as a fraction
+                    # of that row's norm*, so the noise/signal ratio is scale-invariant
+                    # instead of an absolute kick that an un-normalized row could dilute
+                    # or amplify. Touched rows only; resampled each step.
+                    row_norm = row.norm(dim=1, keepdim=True)
+                    row = row + (noise_std * row_norm) * torch.randn_like(row)
+                    if unit_norm:  # keep the stored row on the unit sphere
+                        row = row / row.norm(dim=1, keepdim=True).clamp_min(eps)
                 p.data[idx] = row.to(p.dtype)
         return loss

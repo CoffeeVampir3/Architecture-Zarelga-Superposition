@@ -19,6 +19,7 @@ from engram.GramReaperSparse import GramReaperSparse
 from modeling.model_config import ModelConfig
 from current_configuration import build_config, TrainingConfig, DEFAULT_TRAINING
 from cut_cross_entropy import linear_cross_entropy
+from cut_cross_entropy.utils import compute_z_loss
 
 from modeling.zRMSNorm import ZeroCenteredRMSNorm
 
@@ -145,22 +146,48 @@ def auxillary_loss_free_update(model, all_topk_indices, update_rate, attention_m
 def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
                            momentum=0.95, gain_lr=1e-3,
                            adam_betas=(0.9, 0.95), adam_eps=1e-16,
-                           head_weight_decay=0.1,
+                           head_weight_decay=0.1, norm_weight_decay=0.1,
                            embedding_lr=3e-3 * 2**0.5, embedding_beta=0.9,
                            capture_warmup_steps=5):
     """Build dense and sparse optimizer groups for the model."""
     embedding_param = model.embedding.weight
 
-    engram_sparse_params = []
+    norm_gain_ids = {
+        id(m.weight)
+        for m in model.modules()
+        if isinstance(m, ZeroCenteredRMSNorm) and m.weight is not None and m.weight.requires_grad
+    }
+
+    # Engram memory tables go to the sparse optimizer. Each main n-gram embedding
+    # table gets its own per-layer group so annealed corruption noise can be
+    # scaled per layer; importance tables get a separate no-noise group.
+    engram_embed_groups = []
+    engram_imp_params = []
     engrams = getattr(model, "engrams", None)
     if engrams is not None:
-        for engram in engrams.values():
-            engram_sparse_params.append(engram.embedding.weight)
+        eng_cfg = model.config.engram
+        layers = list(eng_cfg.layers)
+        scales = eng_cfg.noise_layer_scale or tuple(1.0 for _ in layers)
+        scale_by_layer = {int(l): float(s) for l, s in zip(layers, scales)}
+        for key, engram in engrams.items():
+            layer_idx = int(key)
+            engram_embed_groups.append(dict(
+                params=[engram.embedding.weight],
+                unit_norm=True,
+                noise_std=0.0,
+                engram_noise=True,
+                engram_layer=layer_idx,
+                noise_layer_scale=scale_by_layer.get(layer_idx, 1.0),
+            ))
             if engram.importance_weighting:
-                engram_sparse_params.append(engram.imp_table.weight)
-    sparse_param_ids = {id(embedding_param)} | {id(p) for p in engram_sparse_params}
+                engram_imp_params.append(engram.imp_table.weight)
 
-    muon_params, router_params, embed_params, scalar_params = [], [], [], []
+    sparse_param_ids = {id(embedding_param)}
+    for group in engram_embed_groups:
+        sparse_param_ids.add(id(group["params"][0]))
+    sparse_param_ids |= {id(p) for p in engram_imp_params}
+
+    muon_params, router_params, embed_params, scalar_params, norm_gain_params = [], [], [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -172,6 +199,8 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
             embed_params.append(param)
         elif param.ndim >= 2:
             (router_params if is_router else muon_params).append(param)
+        elif id(param) in norm_gain_ids:
+            norm_gain_params.append(param)
         else:
             scalar_params.append(param)
 
@@ -196,6 +225,11 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
                  betas=adam_betas, eps=adam_eps,
                  weight_decay=head_weight_decay, capturable=True),
         )
+    if norm_gain_params:
+        param_groups.append(
+            dict(params=norm_gain_params, use_muon=False, lr=scalar_lr_tensor,
+                 betas=adam_betas, eps=adam_eps, weight_decay=norm_weight_decay, capturable=True),
+        )
     param_groups.append(
         dict(params=scalar_params, use_muon=False, lr=scalar_lr_tensor,
              betas=adam_betas, eps=adam_eps, weight_decay=0.0, capturable=True),
@@ -203,8 +237,9 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
     dense_optimizer = SingleDeviceMuonMDWithAuxAdam(param_groups)
 
     sparse_param_groups = [dict(params=[embedding_param], unit_norm=True)]
-    if engram_sparse_params:
-        sparse_param_groups.append(dict(params=engram_sparse_params, unit_norm=False))
+    sparse_param_groups.extend(engram_embed_groups)
+    if engram_imp_params:
+        sparse_param_groups.append(dict(params=engram_imp_params, unit_norm=False))
     sparse_optimizer = GramReaperSparse(
         sparse_param_groups, lr=float(embedding_lr), beta=embedding_beta, unit_norm=True,
     )
@@ -280,6 +315,47 @@ class LinearDecayScheduler:
         return self.base_lrs[0] * fraction
 
 
+class EngramNoiseAnnealer:
+    """Anneal the Engram memory-corruption noise std from sigma0 -> 0.
+
+    Mirrors the LR schedulers: each step it writes a per-group ``noise_std`` into
+    the sparse optimizer's Engram embedding groups (the ones tagged
+    ``engram_noise=True``). The std decays from ``sigma0`` to exactly 0 over the
+    first ``anneal_frac`` of training and is held at 0 afterwards, so the final
+    phase converges on the clean objective. ``noise_layer_scale`` lets each layer
+    scale the shared schedule.
+    """
+
+    def __init__(self, sparse_optimizer, sigma0, anneal_frac, total_steps, schedule="cosine"):
+        self.sigma0 = float(sigma0)
+        self.anneal_frac = float(anneal_frac)
+        self.total_steps = max(1, int(total_steps))
+        self.schedule = schedule
+        self.groups = [g for g in sparse_optimizer.param_groups if g.get("engram_noise")]
+
+    @staticmethod
+    def sigma_fraction(progress, anneal_frac, schedule):
+        """Schedule multiplier in [0, 1]: 1 at progress 0, exactly 0 once
+        progress reaches ``anneal_frac``. Pure function (unit-tested)."""
+        if progress >= anneal_frac:
+            return 0.0
+        x = progress / anneal_frac  # in [0, 1)
+        if schedule == "cosine":
+            return 0.5 * (1.0 + math.cos(math.pi * x))
+        return 1.0 - x  # linear
+
+    def sigma_at(self, step_idx):
+        progress = step_idx / max(1, self.total_steps - 1)
+        return self.sigma0 * self.sigma_fraction(progress, self.anneal_frac, self.schedule)
+
+    def step(self, step_idx):
+        """Set ``noise_std`` on each tagged group; return the base (unscaled) sigma."""
+        base = self.sigma_at(step_idx)
+        for group in self.groups:
+            group["noise_std"] = base * group.get("noise_layer_scale", 1.0)
+        return base
+
+
 def _checkpoint_trainer_state_path(checkpoint_path):
     return checkpoint_path.with_suffix(".trainer.pt")
 
@@ -326,7 +402,9 @@ def train(
     muon_lr = training.muon_lr
     adam_lr = training.adam_lr
     update_rate = training.update_rate
+    z_loss_coef = training.z_loss_coef
     head_weight_decay = training.head_weight_decay
+    norm_weight_decay = training.norm_weight_decay
     checkpoint_interval_steps = training.checkpoint_interval_steps
     max_rolling_checkpoints = training.max_rolling_checkpoints
     log_interval = training.log_interval
@@ -342,7 +420,7 @@ def train(
         model, device, muon_lr=muon_lr, adam_lr=adam_lr,
         momentum=muon_momentum, gain_lr=gain_lr,
         adam_betas=adam_betas, adam_eps=adam_eps,
-        head_weight_decay=head_weight_decay,
+        head_weight_decay=head_weight_decay, norm_weight_decay=norm_weight_decay,
         embedding_lr=training.embedding_lr, embedding_beta=training.embedding_beta,
         capture_warmup_steps=training.capture_warmup_steps,
     )
@@ -376,6 +454,16 @@ def train(
         warmup_steps=warmup_steps,
         min_lr_ratio=training.min_lr_ratio,
     )
+
+    noise_annealer = None
+    if model.config.engram.noise_enabled:
+        noise_annealer = EngramNoiseAnnealer(
+            optimizer.sparse,
+            sigma0=model.config.engram.noise_std,
+            anneal_frac=model.config.engram.noise_anneal_frac,
+            total_steps=total_steps,
+            schedule=model.config.engram.noise_schedule,
+        )
     logger.log_params({
         'batch_size': batch_size,
         'muon_lr': muon_lr,
@@ -383,6 +471,7 @@ def train(
         'num_epochs': num_epochs,
         'sequence_length': sequence_length,
         'update_rate': update_rate,
+        'z_loss_coef': z_loss_coef,
         'optimizer': 'SingleDeviceMuonMDWithAuxAdam (capturable / CUDA-graph)',
         'optimizer_momentum': muon_momentum,
         'optimizer_gain_lr': gain_lr,
@@ -390,6 +479,7 @@ def train(
         'adam_eps': adam_eps,
         'weight_decay': 0.0,
         'head_weight_decay': head_weight_decay,
+        'norm_weight_decay': norm_weight_decay,
         'lr_schedule': 'linear_decay_warmup_free',
         'warmup_steps': warmup_steps,
         'min_lr': muon_lr * scheduler.min_lr_ratio,
@@ -408,6 +498,9 @@ def train(
         'engram/importance_weighting': model.config.engram.importance_weighting,
         'engram/head_norm': model.config.engram.head_norm,
         'engram/learned_gate': model.config.engram.learned_gate,
+        'engram/noise_std': model.config.engram.noise_std,
+        'engram/noise_anneal_frac': model.config.engram.noise_anneal_frac,
+        'engram/noise_schedule': model.config.engram.noise_schedule,
         'loss/backend': 'linear_cross_entropy',
     })
 
@@ -422,6 +515,7 @@ def train(
     total_loss = 0.0
     total_tokens_processed = 0
     loss_accum = torch.zeros((), device=device)
+    z_loss_accum = torch.zeros((), device=device)
     steps_since_log = 0
     train_start_time = time.time()
     train_iter = iter(train_loader)
@@ -435,6 +529,8 @@ def train(
 
         t = step_idx / max(1, total_steps - 1)
         scheduler.step(increment=1)
+        if noise_annealer is not None:
+            noise_annealer.step(step_idx)
 
         batch, train_iter = next_batch(train_loader, train_iter)
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -451,18 +547,38 @@ def train(
                 max_seqlen=max_seqlen,
             )
             classifier = model.get_classifier_weights()
-            loss = linear_cross_entropy(
+            ce_loss, lse = linear_cross_entropy(
                 embeddings.reshape(-1, embeddings.size(-1)),
                 classifier,
                 labels,
                 ignore_index=-100,
+                return_lse=True,
             )
+
+            if z_loss_coef > 0.0:
+                # `lse` comes back at the full [total_tokens] shape with ignored
+                # (segment-final, -100) positions zero-filled. Pass labels so the
+                # mean is taken over *valid* tokens only — same denominator as the
+                # CE loss above — otherwise the packed ignore tokens dilute z-loss
+                # by a batch-composition-dependent factor.
+                z_loss = compute_z_loss(
+                    lse,
+                    targets=labels,
+                    shift=0,
+                    ignore_index=-100,
+                    reduction="mean",
+                )
+                loss = ce_loss + z_loss_coef * z_loss
+            else:
+                z_loss = torch.zeros((), device=ce_loss.device)
+                loss = ce_loss
 
         loss.backward()
 
         optimizer.step()
 
         loss_accum += loss.detach()
+        z_loss_accum += z_loss.detach()
         auxillary_loss_free_update(model, all_topk_indices, update_rate, attention_mask=None)
 
         step_idx += 1
@@ -476,43 +592,36 @@ def train(
         if optimizer_step_count % log_interval == 0:
             chunk_loss = loss_accum.item()
             loss_accum.zero_()
+            chunk_z_loss = z_loss_accum.item()
+            z_loss_accum.zero_()
             total_loss += chunk_loss
             mean_loss = chunk_loss / steps_since_log
+            mean_z_loss = chunk_z_loss / steps_since_log
             steps_since_log = 0
 
             num_tokens = int(input_ids.shape[1])
             num_segments = int(cu_seqlens.numel() - 1)
-            mem_alloc_gb = torch.cuda.memory_allocated() / 1e9
-            mem_reserved_gb = torch.cuda.memory_reserved() / 1e9
-            mem_max_alloc_gb = torch.cuda.max_memory_allocated() / 1e9
-            frag_gb = mem_reserved_gb - mem_alloc_gb
             total_tokens_human = format_token_count(total_tokens_processed)
             pbar.set_postfix(
                 loss=f"{mean_loss:.3f}",
                 tok=num_tokens,
                 total=total_tokens_human,
                 seg=num_segments,
-                alloc=f"{mem_alloc_gb:.2f}",
-                resv=f"{mem_reserved_gb:.2f}",
-                frag=f"{frag_gb:.2f}",
             )
             tqdm.write(
-                f"[mem] step={step_idx} tok={num_tokens} total={total_tokens_human} seg={num_segments} "
-                f"alloc={mem_alloc_gb:.2f}GB resv={mem_reserved_gb:.2f}GB "
-                f"frag={frag_gb:.2f}GB max_alloc={mem_max_alloc_gb:.2f}GB"
+                f"[step] step={step_idx} tok={num_tokens} total={total_tokens_human} seg={num_segments}"
             )
 
             detailed_logging = (optimizer_step_count % logger.detailed_frequency == 0)
             metrics = logger.log_training_metrics(mean_loss, optimizer, update_rate)
             metrics.update(logger.log_moe_metrics(all_topk_indices, global_step, attention_mask=None))
+            metrics["loss/z_loss"] = mean_z_loss
+            metrics["loss/z_loss_coef"] = z_loss_coef
             metrics["mem/num_tokens"] = num_tokens
             metrics["mem/total_tokens_processed"] = total_tokens_processed
             metrics["mem/num_segments"] = num_segments
-            metrics["mem/allocated_gb"] = mem_alloc_gb
-            metrics["mem/reserved_gb"] = mem_reserved_gb
-            metrics["mem/max_allocated_gb"] = mem_max_alloc_gb
-            metrics["mem/fragmentation_gb"] = frag_gb
-            metrics.update(logger.log_engram_metrics(global_step, detailed=detailed_logging))
+            metrics.update(logger.log_engram_metrics(
+                global_step, detailed=detailed_logging))
             logger.log(metrics, step=global_step, model=model, detailed_logging=detailed_logging)
 
         if checkpoint_interval_steps > 0 and (

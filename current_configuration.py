@@ -52,15 +52,20 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
         pos_rope_dims=16,
 
         engram=EngramSettings(
-            layers=(2, 4),
+            layers=(2, 5),
             orders=(2, 3),
             n_heads=4,
-            rows_per_head=65536,
+            rows_per_head=8192 * 4,
             dim_per_head=64,
             alpha_init=0.1,
             importance_weighting=True,
             head_norm=True,
             learned_gate=False,
+            # Diffusion-style annealed memory corruption: high noise early, 0 by
+            # mid-training. sigma0 is a first guess — tune against observed row norms.
+            noise_std=0.02,
+            noise_anneal_frac=0.29289321881,
+            noise_schedule="cosine",
         ),
     )
 
@@ -117,6 +122,7 @@ class TrainingConfig:
     adam_eps: float = 1e-16
     embedding_beta: float = 0.9
     head_weight_decay: float = 0.1  # decoupled WD on the (untied) LM head; input embedding is unit-norm instead
+    norm_weight_decay: float = 0.1
     capture_warmup_steps: int = 5
 
     # --- LR schedule ---
@@ -125,6 +131,10 @@ class TrainingConfig:
 
     # --- aux-loss-free expert balancing ---
     update_rate: float = 1e-3
+
+    # --- z-loss (log-Z regularization on the LM head logits) ---
+    # Penalizes mean(lse^2) over *valid* (non-ignored) tokens. Set to 0 to disable.
+    z_loss_coef: float = 1e-4
 
     # --- checkpointing / logging ---
     checkpoint_interval_steps: int = 10_000
