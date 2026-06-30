@@ -1,27 +1,3 @@
-"""EngramEmbeddingSparse — Engram per-layer memory with a SPARSE-gradient table.
-
-Sparse counterpart of :class:`engram.prod.EngramEmbeddingDense`. Byte-for-byte
-identical except the table is built with ``nn.Embedding(..., sparse=True)``, so
-backward produces a COO sparse gradient (indices over the touched rows, values
-``[nnz, dim]``) instead of a full ``[n_rows, dim]`` dense grad. Pair with
-:class:`engram.prod.GramReaperSparse`, which consumes that sparse grad directly.
-
-Note: ``sparse=True`` restricts the table to optimizers that understand sparse
-gradients (GramReaperSparse, ``torch.optim.SparseAdam``, sparse SGD). The dense
-side-modules (``value_proj``, ``alpha``) keep dense grads and a normal optimizer.
-
-    h <- h + alpha * W_V( concat_heads  E[ address(token n-grams) ] )
-
-Addressing: suffix n-grams (orders 2,3) -> multiplicative-XOR mix with per-layer
-odd, overflow-safe multipliers -> mod a *distinct prime per head*. It depends only
-on token IDs, so the address is a fixed function computable before the forward pass.
-
-Usage:
-    cfg = EngramConfig(vocab_size=50257, d_model=768, layer_id=6)
-    engram = EngramEmbeddingSparse(cfg)
-    hidden = engram(hidden, token_ids)     # [B, T, d_model], [B, T]
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
