@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
 
 _I64_MAX = (1 << 63) - 1
 _PRIME_1 = 10007  # per-layer multiplier seed offset (reference constant)
+
+_GATE_MODES = ("fixed_alpha", "learned_per_channel_alpha", "context_gate")
 
 # Deterministic Miller-Rabin witnesses: exact for the whole 64-bit range.
 _WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
@@ -51,7 +54,7 @@ def _distinct_primes(target: int, count: int, seen: set[int]) -> list[int]:
 
 @dataclass
 class EngramConfig:
-    """Configuration for one per-layer Engram embedding."""
+    """Configuration for one Engram embedding (may be weight-tied across layers)."""
 
     vocab_size: int                    # token vocabulary the addresses are formed from
     d_model: int                       # backbone hidden size (the residual stream width)
@@ -59,14 +62,13 @@ class EngramConfig:
     n_heads: int = 4                   # independent hash heads per order
     rows_per_head: int = 65537         # target rows/head; a distinct prime is found at/above
     dim_per_head: int = 64             # embedding width per head
-    layer_id: int = 0                  # per-layer seed (base_seed = seed + 10007*layer_id)
+    layer_id: int = 0                  # per-engram seed (base_seed = seed + 10007*layer_id)
     seed: int = 0
     pad_id: int = 0                    # left-pad token for suffix n-grams
-    alpha_init: float = 0.1
+    alpha_init: float = 0.1            # used by the alpha gate modes only
     importance_weighting: bool = False
     head_norm: bool = False
-    learned_gate: bool = True
-    forward_noise: bool = False                # Song-Ermon mode: perturb looked-up rows in-forward
+    gate_mode: str = "context_gate"    # fixed_alpha | learned_per_channel_alpha | context_gate
     table_dtype: torch.dtype = torch.bfloat16  # storage dtype for the hashed n-gram tables
 
     @property
@@ -79,7 +81,14 @@ class EngramConfig:
 
 
 class EngramEmbeddingSparse(nn.Module):
-    """Per-layer hashed n-gram memory; sparse-gradient table (``sparse=True``)."""
+    """Hashed n-gram memory; sparse-gradient table (``sparse=True``). One instance
+    may be weight-tied across several layers (``read`` once, ``inject`` per layer).
+
+    Gate modes (ablation-validated; see runs/engram_ablating/EXPERIMENT_REPORT.md):
+      context_gate               per-token scalar sigma(signed_sqrt(RMSNorm(h)·RMSNorm(W_K e)/sqrt(d)))
+      learned_per_channel_alpha  trainable d_model-vector output scale
+      fixed_alpha                constant per-channel output scale (legacy default)
+    """
 
     def __init__(self, config: EngramConfig):
         super().__init__()
@@ -96,6 +105,13 @@ class EngramEmbeddingSparse(nn.Module):
         r = torch.randint(0, half, (self.max_order,), generator=g, dtype=torch.int64)
         self.register_buffer("multipliers", r * 2 + 1)
 
+        # Tokenizer compression: surjective old->canonical ID map applied before hashing
+        # so textually-equivalent tokens (case/accent/space-run variants) share n-gram
+        # rows. Identity until filled (see engram.tokenizer_compression.build_token_canon);
+        # persistent, so checkpoints carry the map and inference needs no tokenizer pass.
+        self.register_buffer("token_canon",
+                             torch.arange(int(config.vocab_size), dtype=torch.int64))
+
         seen: set[int] = set()
         head_sizes: list[int] = []
         for _ in self.orders:
@@ -110,16 +126,28 @@ class EngramEmbeddingSparse(nn.Module):
                                       sparse=True, dtype=config.table_dtype)
 
         self.value_proj = nn.Linear(config.engram_dim, config.d_model)
-        self.learned_gate = bool(config.learned_gate)
-        alpha = torch.full((config.d_model,), float(config.alpha_init))
-        if self.learned_gate:
-            self.alpha = nn.Parameter(alpha)
+        if config.gate_mode not in _GATE_MODES:
+            raise ValueError(f"gate_mode must be one of {_GATE_MODES}, got {config.gate_mode!r}")
+        self.gate_mode = config.gate_mode
+        if self.gate_mode == "context_gate":
+            self.key_proj = nn.Linear(config.engram_dim, config.d_model)
+            self.query_norm = nn.RMSNorm(config.d_model)
+            self.key_norm = nn.RMSNorm(config.d_model)
+            self.register_buffer("last_gate_mean", torch.zeros((), dtype=torch.float32), persistent=False)
+            self.register_buffer("last_gate_std", torch.zeros((), dtype=torch.float32), persistent=False)
         else:
-            self.register_buffer("alpha", alpha)
+            alpha = torch.full((config.d_model,), float(config.alpha_init))
+            if self.gate_mode == "learned_per_channel_alpha":
+                self.alpha = nn.Parameter(alpha)
+            else:
+                self.register_buffer("alpha", alpha)
 
         nn.init.zeros_(self.embedding.weight)
         nn.init.xavier_uniform_(self.value_proj.weight)
         nn.init.zeros_(self.value_proj.bias)
+        if self.gate_mode == "context_gate":
+            nn.init.xavier_uniform_(self.key_proj.weight)
+            nn.init.zeros_(self.key_proj.bias)
 
         self.head_norm = bool(config.head_norm)
         self.importance_weighting = bool(config.importance_weighting)
@@ -160,18 +188,50 @@ class EngramEmbeddingSparse(nn.Module):
     def addresses(self, token_ids: torch.Tensor,
                   position_ids: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, T]`` token stream -> ``[B, T, heads_total]`` head-local row indices."""
-        return self._addresses(token_ids, self.multipliers, position_ids)
+        cids = self.token_canon[token_ids.to(torch.int64)]
+        return self._addresses(cids, self.multipliers, position_ids)
+
+    def read(self, token_ids: torch.Tensor,
+             position_ids: torch.Tensor | None = None) -> tuple:
+        """Token-addressed memory readout, independent of the residual stream.
+
+        Returns ``(delta, key)`` with ``key`` None outside context_gate mode. When
+        one engram is weight-tied across several layers, call this once and feed
+        the result to ``inject`` at each layer.
+        """
+        cids = self.token_canon[token_ids.to(torch.int64)]
+        addr = self._addresses(cids, self.multipliers, position_ids) + self.offsets  # [B, T, H_total]
+        e = self.embedding(addr)                                        # [B, T, H_total, dim]
+        if self.importance_weighting:                                   # per-head scalar reweight
+            iaddr = self._addresses(cids, self.imp_multipliers, position_ids) + self.offsets
+            e = e * self.imp_table(iaddr)                               # [B, T, H_total, dim]
+        if self.head_norm:                                       # shrink-only: cap per-head L2 norm at 1
+            e = e / e.norm(dim=-1, keepdim=True).clamp_min(1.0)  # bounds value_proj input; zeros stay zero
+        flat = e.flatten(start_dim=-2)
+        delta = self.value_proj(flat)                            # [B, T, d_model]
+        key = self.key_proj(flat) if self.gate_mode == "context_gate" else None
+        return delta, key
+
+    def inject(self, hidden_states: torch.Tensor, delta: torch.Tensor,
+               key: torch.Tensor | None) -> torch.Tensor:
+        """Gate a memory readout from ``read`` into the residual stream."""
+        delta = delta.to(hidden_states.dtype)
+        if self.gate_mode == "context_gate":
+            normed_key = self.key_norm(key.float())
+            normed_query = self.query_norm(hidden_states.float())
+            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(float(self.config.d_model))
+            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()   # signed-sqrt squash
+            gate = gate.sigmoid().unsqueeze(-1).to(hidden_states.dtype)
+            if self.training:
+                with torch.no_grad():
+                    self.last_gate_mean.copy_(gate.float().mean())
+                    self.last_gate_std.copy_(gate.float().std(unbiased=False))
+            return hidden_states + gate * delta
+        return hidden_states + self.alpha * delta
 
     def forward(self, hidden_states: torch.Tensor,
                 token_ids: torch.Tensor,
                 position_ids: torch.Tensor | None = None) -> torch.Tensor:
         """hidden_states: [B, T, d_model]; token_ids: [B, T] -> [B, T, d_model]."""
-        addr = self.addresses(token_ids, position_ids) + self.offsets   # [B, T, H_total]
-        e = self.embedding(addr)                                        # [B, T, H_total, dim]
-        if self.importance_weighting:                                   # per-head scalar reweight
-            iaddr = self._addresses(token_ids, self.imp_multipliers, position_ids) + self.offsets
-            e = e * self.imp_table(iaddr)                               # [B, T, H_total, dim]
-        if self.head_norm:                                       # shrink-only: cap per-head L2 norm at 1
-            e = e / e.norm(dim=-1, keepdim=True).clamp_min(1.0)  # bounds value_proj input; zeros stay zero
-        delta = self.value_proj(e.flatten(start_dim=-2))         # [B, T, d_model]
-        return hidden_states + self.alpha * delta.to(hidden_states.dtype)
+        delta, key = self.read(token_ids, position_ids)
+        return self.inject(hidden_states, delta, key)

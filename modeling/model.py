@@ -32,14 +32,24 @@ class MoEModel(nn.Module):
         self.output_layer = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.tie_word_embeddings = config.tie_word_embeddings
 
-        self.engram_layers = tuple(int(i) for i in config.engram.layers)
-        if self.engram_layers:
+        # config.engram.layers maps engram id -> layers it's injected at; one module
+        # per id, weight-tied across its layer group. ModuleDict is keyed by str(id).
+        self.engram_map = {
+            int(eid): tuple(int(i) for i in group)
+            for eid, group in config.engram.layers.items()
+        }
+        if self.engram_map:
             self.engrams = nn.ModuleDict({
-                str(layer_idx): self._build_engram(config, layer_idx)
-                for layer_idx in self.engram_layers
+                str(eid): self._build_engram(config, eid)
+                for eid in sorted(self.engram_map)
             })
+            self._engrams_at = {}  # layer_idx -> ModuleDict keys, in id order
+            for eid in sorted(self.engram_map):
+                for layer_idx in self.engram_map[eid]:
+                    self._engrams_at.setdefault(layer_idx, []).append(str(eid))
         else:
             self.engrams = None
+            self._engrams_at = {}
 
         self.reset_parameters()
         if self.tie_word_embeddings:
@@ -63,7 +73,7 @@ class MoEModel(nn.Module):
             emb = emb * (self.config.hidden_size ** 0.5)
         return emb
 
-    def _build_engram(self, config, layer_idx):
+    def _build_engram(self, config, engram_id):
         engram = EngramEmbeddingSparse(EngramConfig(
             vocab_size=config.vocab_size,
             d_model=config.hidden_size,
@@ -71,22 +81,31 @@ class MoEModel(nn.Module):
             n_heads=config.engram.n_heads,
             rows_per_head=config.engram.rows_per_head,
             dim_per_head=config.engram.dim_per_head,
-            layer_id=layer_idx,
+            layer_id=engram_id,
             pad_id=config.pad_token_id,
             alpha_init=config.engram.alpha_init,
             importance_weighting=config.engram.importance_weighting,
             head_norm=config.engram.head_norm,
-            learned_gate=config.engram.learned_gate,
+            gate_mode=config.engram.gate_mode,
         ))
         nn.init.normal_(engram.value_proj.weight, mean=0.0, std=config.initializer_range)
+        if getattr(engram, "key_proj", None) is not None:
+            nn.init.normal_(engram.key_proj.weight, mean=0.0, std=config.initializer_range)
         return engram
 
     def _run_layers(self, x, token_ids, position_ids, cu_seqlens, max_seqlen):
         all_topk_indices = []
         apply_engram = self.engrams is not None and token_ids is not None and token_ids.dim() == 2
+        # Memory readouts depend only on the token stream, so an engram tied across
+        # several layers reads its table once; only the gate runs per layer.
+        engram_reads = {}
         for layer_idx, layer in enumerate(self.layers):
-            if apply_engram and str(layer_idx) in self.engrams:
-                x = self.engrams[str(layer_idx)](x, token_ids, position_ids)
+            if apply_engram:
+                for key in self._engrams_at.get(layer_idx, ()):
+                    engram = self.engrams[key]
+                    if key not in engram_reads:
+                        engram_reads[key] = engram.read(token_ids, position_ids)
+                    x = engram.inject(x, *engram_reads[key])
             x, topk_idx = layer(
                 x,
                 position_ids=position_ids,

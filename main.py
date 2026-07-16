@@ -16,6 +16,7 @@ from modeling.model import MoEModel
 from optimizer.muon import SingleDeviceMuonMDWithAuxAdam
 from optimizer.hybrid import HybridGraphOptimizer
 from engram.GramReaperSparse import GramReaperSparse
+from engram.tokenizer_compression import apply_token_canon
 from modeling.model_config import ModelConfig
 from current_configuration import build_config, TrainingConfig, DEFAULT_TRAINING
 from cut_cross_entropy import linear_cross_entropy
@@ -158,26 +159,20 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
         if isinstance(m, ZeroCenteredRMSNorm) and m.weight is not None and m.weight.requires_grad
     }
 
-    # Engram memory tables go to the sparse optimizer. Each main n-gram embedding
-    # table gets its own per-layer group so annealed corruption noise can be
-    # scaled per layer; importance tables get a separate no-noise group.
+    # Engram memory tables go to the sparse optimizer (one group per table);
+    # importance tables get a separate group.
     engram_embed_groups = []
     engram_imp_params = []
     engrams = getattr(model, "engrams", None)
     if engrams is not None:
-        eng_cfg = model.config.engram
-        layers = list(eng_cfg.layers)
-        scales = eng_cfg.noise_layer_scale or tuple(1.0 for _ in layers)
-        scale_by_layer = {int(l): float(s) for l, s in zip(layers, scales)}
-        for key, engram in engrams.items():
-            layer_idx = int(key)
+        # Memory-table rows grow freely from zero-init under a shrink-only L2 cap
+        # (ablation-accepted replacement for the old per-row unit_norm).
+        row_norm_cap = float(model.config.engram.row_norm_cap)
+        for engram in engrams.values():
             engram_embed_groups.append(dict(
                 params=[engram.embedding.weight],
-                unit_norm=True,
-                noise_std=0.0,
-                engram_noise=True,
-                engram_layer=layer_idx,
-                noise_layer_scale=scale_by_layer.get(layer_idx, 1.0),
+                unit_norm=False,
+                row_norm_cap=row_norm_cap,
             ))
             if engram.importance_weighting:
                 engram_imp_params.append(engram.imp_table.weight)
@@ -236,12 +231,13 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
     )
     dense_optimizer = SingleDeviceMuonMDWithAuxAdam(param_groups)
 
-    sparse_param_groups = [dict(params=[embedding_param], unit_norm=True)]
+    sparse_param_groups = [dict(params=[embedding_param], unit_norm=True, row_norm_cap=0.0)]
     sparse_param_groups.extend(engram_embed_groups)
     if engram_imp_params:
-        sparse_param_groups.append(dict(params=engram_imp_params, unit_norm=False))
+        sparse_param_groups.append(dict(params=engram_imp_params, unit_norm=False, row_norm_cap=0.0))
     sparse_optimizer = GramReaperSparse(
-        sparse_param_groups, lr=float(embedding_lr), beta=embedding_beta, unit_norm=True,
+        sparse_param_groups, lr=float(embedding_lr), beta=embedding_beta,
+        unit_norm=True, row_norm_cap=0.0,
     )
 
     return HybridGraphOptimizer(
@@ -313,47 +309,6 @@ class LinearDecayScheduler:
             else:
                 param_group['lr'] = lr
         return self.base_lrs[0] * fraction
-
-
-class EngramNoiseAnnealer:
-    """Anneal the Engram memory-corruption noise std from sigma0 -> 0.
-
-    Mirrors the LR schedulers: each step it writes a per-group ``noise_std`` into
-    the sparse optimizer's Engram embedding groups (the ones tagged
-    ``engram_noise=True``). The std decays from ``sigma0`` to exactly 0 over the
-    first ``anneal_frac`` of training and is held at 0 afterwards, so the final
-    phase converges on the clean objective. ``noise_layer_scale`` lets each layer
-    scale the shared schedule.
-    """
-
-    def __init__(self, sparse_optimizer, sigma0, anneal_frac, total_steps, schedule="cosine"):
-        self.sigma0 = float(sigma0)
-        self.anneal_frac = float(anneal_frac)
-        self.total_steps = max(1, int(total_steps))
-        self.schedule = schedule
-        self.groups = [g for g in sparse_optimizer.param_groups if g.get("engram_noise")]
-
-    @staticmethod
-    def sigma_fraction(progress, anneal_frac, schedule):
-        """Schedule multiplier in [0, 1]: 1 at progress 0, exactly 0 once
-        progress reaches ``anneal_frac``. Pure function (unit-tested)."""
-        if progress >= anneal_frac:
-            return 0.0
-        x = progress / anneal_frac  # in [0, 1)
-        if schedule == "cosine":
-            return 0.5 * (1.0 + math.cos(math.pi * x))
-        return 1.0 - x  # linear
-
-    def sigma_at(self, step_idx):
-        progress = step_idx / max(1, self.total_steps - 1)
-        return self.sigma0 * self.sigma_fraction(progress, self.anneal_frac, self.schedule)
-
-    def step(self, step_idx):
-        """Set ``noise_std`` on each tagged group; return the base (unscaled) sigma."""
-        base = self.sigma_at(step_idx)
-        for group in self.groups:
-            group["noise_std"] = base * group.get("noise_layer_scale", 1.0)
-        return base
 
 
 def _checkpoint_trainer_state_path(checkpoint_path):
@@ -455,15 +410,6 @@ def train(
         min_lr_ratio=training.min_lr_ratio,
     )
 
-    noise_annealer = None
-    if model.config.engram.noise_enabled:
-        noise_annealer = EngramNoiseAnnealer(
-            optimizer.sparse,
-            sigma0=model.config.engram.noise_std,
-            anneal_frac=model.config.engram.noise_anneal_frac,
-            total_steps=total_steps,
-            schedule=model.config.engram.noise_schedule,
-        )
     logger.log_params({
         'batch_size': batch_size,
         'muon_lr': muon_lr,
@@ -489,7 +435,8 @@ def train(
         'attention/do_rope': model.config.do_rope,
         'attention/pos_rope_dims': model.config.pos_rope_dims,
         'engram/enabled': model.config.engram.enabled,
-        'engram/layers': list(model.config.engram.layers),
+        'engram/layers': {str(eid): list(group)
+                          for eid, group in model.config.engram.layers.items()},
         'engram/orders': list(model.config.engram.orders),
         'engram/n_heads': model.config.engram.n_heads,
         'engram/rows_per_head': model.config.engram.rows_per_head,
@@ -497,10 +444,9 @@ def train(
         'engram/alpha_init': model.config.engram.alpha_init,
         'engram/importance_weighting': model.config.engram.importance_weighting,
         'engram/head_norm': model.config.engram.head_norm,
-        'engram/learned_gate': model.config.engram.learned_gate,
-        'engram/noise_std': model.config.engram.noise_std,
-        'engram/noise_anneal_frac': model.config.engram.noise_anneal_frac,
-        'engram/noise_schedule': model.config.engram.noise_schedule,
+        'engram/gate_mode': model.config.engram.gate_mode,
+        'engram/row_norm_cap': model.config.engram.row_norm_cap,
+        'engram/tokenizer_compress': model.config.engram.tokenizer_compress,
         'loss/backend': 'linear_cross_entropy',
     })
 
@@ -529,8 +475,6 @@ def train(
 
         t = step_idx / max(1, total_steps - 1)
         scheduler.step(increment=1)
-        if noise_annealer is not None:
-            noise_annealer.step(step_idx)
 
         batch, train_iter = next_batch(train_loader, train_iter)
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -674,6 +618,9 @@ def main():
     config = build_config(len(tokenizer), tokenizer.pad_token_id)
 
     model = MoEModel(config)
+    if config.engram.enabled and config.engram.tokenizer_compress:
+        merged = apply_token_canon(model, tokenizer)
+        print(f"Engram tokenizer compression: {merged}/{len(tokenizer)} token IDs merged")
 
     count_parameters_layerwise(model)
     model.headless_forward = torch.compile(model.headless_forward, dynamic=True)

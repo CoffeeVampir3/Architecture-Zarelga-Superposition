@@ -4,39 +4,59 @@ from dataclasses import dataclass, field
 
 @dataclass
 class EngramSettings:
-    """Configuration for Engram conditional-memory branches."""
-    layers: tuple = ()
+    """Configuration for Engram conditional-memory branches.
+
+    Gate and normalization defaults follow the ablation-accepted configuration
+    (runs/engram_ablating/EXPERIMENT_REPORT.md): context gate + shrink-only row-norm
+    cap; the annealed forward-noise curriculum was tested and discarded.
+    """
+    # Placement map: engram id -> transformer layers it's injected at (before the
+    # block). One module (memory table + projections) per id; an id with several
+    # layers is weight-tied across them — the token-addressed readout is shared and
+    # only the gate is per-layer. Examples: {0: (0, 1, 2)} is one engram shared by
+    # layers 0-2; {0: (2,), 1: (5,)} is two independent engrams at layers 2 and 5.
+    # Ids double as hash seeds, so distinct ids hash token n-grams differently.
+    layers: dict = field(default_factory=dict)
     orders: tuple = (2, 3)
     n_heads: int = 4
     rows_per_head: int = 16384
     dim_per_head: int = 64
-    alpha_init: float = 0.1
+    alpha_init: float = 0.1                 # used by the alpha gate modes only
     importance_weighting: bool = False
     head_norm: bool = False
-    learned_gate: bool = True
-
-    # Annealed memory-corruption noise (diffusion-style graduated optimization).
-    # Gaussian noise is added to the touched embedding-table rows in the sparse
-    # optimizer. `noise_std` is the per-row std *as a fraction of that row's norm*
-    # (rows are unit-normalized), so the noise/signal ratio is scale-invariant.
-    # The fraction decays from `noise_std` to exactly 0 over the first
-    # `noise_anneal_frac` of training. `noise_std == 0.0` disables the feature.
-    noise_std: float = 0.0
-    noise_anneal_frac: float = 0.5
-    noise_schedule: str = "cosine"          # "cosine" | "linear"
-    noise_layer_scale: tuple = ()           # per-layer multipliers aligned to `layers`; () = uniform
+    gate_mode: str = "context_gate"         # fixed_alpha | learned_per_channel_alpha | context_gate
+    # Canonical-ID hashing: textually-equivalent tokens (case/accent/space-run
+    # variants) share n-gram rows. The map is filled at model-build time from the
+    # tokenizer (engram.apply_token_canon) and persists in checkpoints.
+    tokenizer_compress: bool = True
+    # Shrink-only L2 cap applied by the sparse optimizer to memory-table rows:
+    # rows grow freely from zero-init (magnitude encodes confidence) but never
+    # exceed the cap (bounded like the old unit_norm). 0 disables (unbounded).
+    row_norm_cap: float = 1.0
 
     @property
     def enabled(self) -> bool:
         return len(self.layers) > 0
 
-    @property
-    def noise_enabled(self) -> bool:
-        return self.enabled and self.noise_std > 0.0
-
     def __post_init__(self):
         if not self.enabled:
             return
+        if not isinstance(self.layers, dict):
+            raise ValueError(
+                "engram layers must be a dict mapping engram id -> layer indices, "
+                f"e.g. {{0: (0, 1, 2)}}; got {self.layers!r}."
+            )
+        normalized = {}
+        for eid, group in self.layers.items():
+            if not isinstance(eid, int) or isinstance(eid, bool) or eid < 0:
+                raise ValueError(f"engram ids must be non-negative ints; got {eid!r}.")
+            group = tuple(group)
+            if not group:
+                raise ValueError(f"engram {eid} has an empty layer group.")
+            if len(set(group)) != len(group):
+                raise ValueError(f"engram {eid} lists a layer more than once: {group}.")
+            normalized[eid] = group
+        self.layers = normalized
         if self.n_heads <= 0:
             raise ValueError("engram n_heads must be positive.")
         if self.rows_per_head <= 0:
@@ -45,17 +65,13 @@ class EngramSettings:
             raise ValueError("engram dim_per_head must be positive.")
         if not self.orders or any(o < 2 for o in self.orders):
             raise ValueError("engram orders must be non-empty with each order >= 2.")
-        if self.noise_std < 0.0:
-            raise ValueError("engram noise_std must be non-negative.")
-        if not (0.0 < self.noise_anneal_frac <= 1.0):
-            raise ValueError("engram noise_anneal_frac must be in (0, 1].")
-        if self.noise_schedule not in ("cosine", "linear"):
-            raise ValueError("engram noise_schedule must be 'cosine' or 'linear'.")
-        if self.noise_layer_scale and len(self.noise_layer_scale) != len(self.layers):
+        if self.gate_mode not in ("fixed_alpha", "learned_per_channel_alpha", "context_gate"):
             raise ValueError(
-                "engram noise_layer_scale must be empty or match len(layers) "
-                f"({len(self.layers)}); got {len(self.noise_layer_scale)}."
+                "engram gate_mode must be 'fixed_alpha', 'learned_per_channel_alpha', "
+                f"or 'context_gate'; got {self.gate_mode!r}."
             )
+        if self.row_norm_cap < 0.0:
+            raise ValueError("engram row_norm_cap must be >= 0 (0 disables).")
 
 
 @dataclass
@@ -158,8 +174,10 @@ class ModelConfig:
                 f"pos_rope_dims ({self.pos_rope_dims}) cannot exceed head_dim ({head_dim})."
             )
 
-        for idx in self.engram.layers:
-            if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0 or idx >= self.transformer_depth:
-                raise ValueError(
-                    f"engram.layers entries must be ints in [0, {self.transformer_depth}); got {idx!r}."
-                )
+        for eid, group in self.engram.layers.items():
+            for idx in group:
+                if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0 or idx >= self.transformer_depth:
+                    raise ValueError(
+                        f"engram {eid} layer entries must be ints in "
+                        f"[0, {self.transformer_depth}); got {idx!r}."
+                    )

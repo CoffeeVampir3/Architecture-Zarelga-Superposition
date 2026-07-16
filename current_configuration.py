@@ -1,18 +1,5 @@
-"""Singular place to configure a run.
-
-Two halves live here:
-
-* the **model** side — named ``ModelConfig`` variants describing the architecture
-  (``build_config`` / ``VARIANTS``), and
-* the **training** side — a ``TrainingConfig`` dataclass holding the run knobs
-  (batch size, learning rates, schedule, checkpointing) that the trainer reads.
-
-Keeping both here means there's one file to open to reconfigure a run instead of
-hunting through the trainer for hardcoded defaults.
-"""
-
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 from modeling.model_config import ModelConfig, EngramSettings
 
@@ -21,8 +8,11 @@ from modeling.model_config import ModelConfig, EngramSettings
 # Model architecture variants
 # ---------------------------------------------------------------------------
 
+# Set to an int to pin the vocab size; leave None to use the tokenizer's.
+VOCAB_SIZE: Optional[int] = None
+
+
 def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
-    """Current model: explicit 8-layer fine-grained MoE architecture."""
     return ModelConfig(
         vocab_size=vocab_size,
         pad_token_id=pad_token_id,
@@ -31,8 +21,8 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
         hidden_size=512,
         transformer_depth=8,
 
-        first_k_dense_replace=3,
-        dense_intermediate_size=1280,
+        first_k_dense_replace=8,
+        dense_intermediate_size=1792,
         intermediate_size=160,
         n_experts=34,
         n_shared_experts=2,
@@ -44,28 +34,29 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
         use_qk_norm=True,
 
         rms_norm_eps=1e-6,
-        max_position_embeddings=4096,
-        sequence_length=4096,
-        rope_theta=10000,
+        max_position_embeddings=8192,
+        sequence_length=8192,
+        rope_theta=100000,
         do_rope=True,
         tie_word_embeddings=False,
         pos_rope_dims=16,
 
+        # Ablation-accepted configuration (runs/engram_ablating/EXPERIMENT_REPORT.md):
+        # context gate + shrink-only row-norm cap, no forward-noise curriculum.
+        # One weight-tied engram shared by the first sliding-window layers 0-2:
+        # the token-addressed readout is computed once; each layer applies its
+        # own context gate.
         engram=EngramSettings(
-            layers=(2, 5),
+            layers={0: (0, 1, 2)},
             orders=(2, 3),
             n_heads=4,
-            rows_per_head=8192 * 4,
+            rows_per_head=65000,
             dim_per_head=64,
-            alpha_init=0.1,
             importance_weighting=True,
             head_norm=True,
-            learned_gate=False,
-            # Diffusion-style annealed memory corruption: high noise early, 0 by
-            # mid-training. sigma0 is a first guess — tune against observed row norms.
-            noise_std=0.02,
-            noise_anneal_frac=0.29289321881,
-            noise_schedule="cosine",
+            gate_mode="context_gate",
+            row_norm_cap=1.0,
+            tokenizer_compress=True,
         ),
     )
 
@@ -86,6 +77,8 @@ def build_config(vocab_size: int, pad_token_id: int,
         raise KeyError(
             f"unknown model variant {variant!r}; known variants: {sorted(VARIANTS)}"
         ) from None
+    if VOCAB_SIZE is not None:
+        vocab_size = VOCAB_SIZE
     return factory(vocab_size, pad_token_id)
 
 
@@ -98,15 +91,9 @@ SQRT2 = 2 ** 0.5
 
 @dataclass
 class TrainingConfig:
-    """Tuning knobs for a training run.
-
-    These are the "training facts" — everything that affects *how* the model is
-    trained rather than *what* the model is. Edit here to reconfigure a run.
-    """
-
     # --- schedule / data ---
     num_epochs: int = 1
-    batch_size: int = 32
+    batch_size: int = 26
     num_workers: int = 4
     prefetch_factor: int = 2
 

@@ -6,6 +6,9 @@ checkpoints/
 .python-version
 outputs/
 uv.lock
+engram_ablating/
+engram_info/
+runs/
 
 
 # Local artifacts
@@ -17,3 +20,4 @@ logs/
 outputs/
 tests/
 refs
+*.pdf

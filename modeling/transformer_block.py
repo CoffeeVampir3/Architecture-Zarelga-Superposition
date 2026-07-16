@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .moe_layer import MoELayer
 from .expert_layer import ExpertMLP
@@ -42,10 +43,10 @@ class TransformerBlock(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_dense:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = checkpoint(self.mlp, hidden_states, use_reentrant=False)
             topk_idx = None
         else:
-            hidden_states, topk_idx = self.mlp(hidden_states)
+            hidden_states, topk_idx = checkpoint(self.mlp, hidden_states, use_reentrant=False)
         hidden_states = residual + hidden_states
 
         return hidden_states, topk_idx

@@ -10,12 +10,16 @@ class GramReaperSparse(Optimizer):
     """Per-row RMSProp consuming a sparse (COO) embedding-table gradient."""
 
     def __init__(self, params, lr: float = 1e-2, beta: float = 0.9,
-                 eps: float = 1e-10, unit_norm: bool = False):
+                 eps: float = 1e-10, unit_norm: bool = False,
+                 row_norm_cap: float = 0.0):
         if lr <= 0:
             raise ValueError(f"lr must be > 0, got {lr}")
         if not (0.0 < beta < 1.0):
             raise ValueError(f"beta must be in (0, 1), got {beta}")
-        super().__init__(params, dict(lr=lr, beta=beta, eps=eps, unit_norm=unit_norm))
+        if row_norm_cap < 0.0:
+            raise ValueError(f"row_norm_cap must be >= 0 (0 disables), got {row_norm_cap}")
+        super().__init__(params, dict(lr=lr, beta=beta, eps=eps, unit_norm=unit_norm,
+                                      row_norm_cap=row_norm_cap))
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -23,7 +27,9 @@ class GramReaperSparse(Optimizer):
         for group in self.param_groups:
             lr, beta, eps = group["lr"], group["beta"], group["eps"]
             unit_norm = group["unit_norm"]
-            noise_std = group.get("noise_std", 0.0)  # annealed memory corruption (0 = off)
+            row_norm_cap = group["row_norm_cap"]
+            if unit_norm and row_norm_cap > 0.0:
+                raise ValueError("unit_norm and row_norm_cap are mutually exclusive per group")
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -57,14 +63,11 @@ class GramReaperSparse(Optimizer):
                 row = p.data[idx].float() - step.unsqueeze(1) * g
                 if unit_norm:
                     row = row / row.norm(dim=1, keepdim=True).clamp_min(eps)
-                if noise_std > 0.0:
-                    # Relative corruption: per-row std is `noise_std` *as a fraction
-                    # of that row's norm*, so the noise/signal ratio is scale-invariant
-                    # instead of an absolute kick that an un-normalized row could dilute
-                    # or amplify. Touched rows only; resampled each step.
-                    row_norm = row.norm(dim=1, keepdim=True)
-                    row = row + (noise_std * row_norm) * torch.randn_like(row)
-                    if unit_norm:  # keep the stored row on the unit sphere
-                        row = row / row.norm(dim=1, keepdim=True).clamp_min(eps)
+                elif row_norm_cap > 0.0:
+                    # Shrink-only ball projection: rows grow freely from zero-init but
+                    # never exceed the cap. Sub-cap dynamics are untouched; saturated
+                    # rows behave exactly like unit_norm rows.
+                    norms = row.norm(dim=1, keepdim=True)
+                    row = row * (row_norm_cap / norms.clamp_min(row_norm_cap))
                 p.data[idx] = row.to(p.dtype)
         return loss

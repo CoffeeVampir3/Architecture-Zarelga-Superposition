@@ -140,14 +140,17 @@ class AimLogger:
         return metrics
 
     def register_engrams(self, model):
-        """Snapshot (layer_idx, module) for each Engram branch so metrics can be
-        attributed per layer. nn.ModuleDict is keyed by the string layer index."""
+        """Snapshot (metric_prefix, module) for each Engram branch. nn.ModuleDict is
+        keyed by the string engram id; the prefix names the layers the id covers
+        (e.g. 'engram/0@L0-1-2') so metrics stay attributable under weight-tying."""
         self.engrams = []
         engrams = getattr(model, 'engrams', None)
         if engrams is None:
             return
+        engram_map = getattr(model, 'engram_map', {})
         for key, engram in engrams.items():
-            self.engrams.append((int(key), engram))
+            layers = '-'.join(str(i) for i in engram_map.get(int(key), ()))
+            self.engrams.append((f'engram/{key}@L{layers}', engram))
 
     def log_engram_metrics(self, step, detailed=False):
         """Per-Engram memory diagnostics."""
@@ -155,8 +158,7 @@ class AimLogger:
             return {}
 
         metrics = {}
-        for layer_idx, engram in self.engrams:
-            prefix = f'engram/layer_{layer_idx}'
+        for prefix, engram in self.engrams:
             weight = engram.embedding.weight
             total_rows = weight.shape[0]
 
@@ -169,6 +171,11 @@ class AimLogger:
                 if detailed and activated > 0:
                     g = coalesced.values()
                     metrics[f'{prefix}/grad_row_norm_mean'] = g.norm(dim=1).mean().item()
+
+            if getattr(engram, 'gate_mode', None) == 'context_gate':
+                # For a weight-tied engram these reflect its last injection site.
+                metrics[f'{prefix}/gate_mean'] = engram.last_gate_mean.item()
+                metrics[f'{prefix}/gate_std'] = engram.last_gate_std.item()
 
             if detailed and getattr(engram, 'importance_weighting', False):
                 imp_weight = engram.imp_table.weight
@@ -203,7 +210,7 @@ class AimLogger:
         layer_match = re.search(r'layers\.(\d+)', name)
         layer_num = int(layer_match.group(1)) if layer_match else -1
 
-        # Engram memory tables are named `engrams.<L>.embedding.weight`.
+        # Engram memory tables are named `engrams.<id>.embedding.weight`.
         if 'engram' in name:
             layer_type = 'engram'
         elif 'mlp' in name or 'expert' in name:
