@@ -1,4 +1,9 @@
+import flash_attn
 from flash_attn import flash_attn_varlen_func
+from flash_attn.flash_attn_interface import (
+    _flash_attn_varlen_backward,
+    _flash_attn_varlen_forward,
+)
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -7,6 +12,61 @@ from einops import rearrange, repeat
 from .liger_rope import LigerRopeFunction
 from .model_config import ModelConfig
 from .zRMSNorm import ZeroCenteredRMSNorm
+
+# The sink path calls flash-attn's underscore-prefixed varlen kernels directly
+# (the public wrapper drops the lse cotangent in backward, which would bias
+# dq/dk). Their signatures are internal and have changed across releases; the
+# call pattern below is validated against 2.7-2.8.
+_FA_VERSION = tuple(int(p) for p in flash_attn.__version__.split(".")[:2])
+_SINK_FA_COMPATIBLE = (2, 7) <= _FA_VERSION < (3, 0)
+
+
+class _SinkFlashAttnVarlen(torch.autograd.Function):
+    """Varlen flash attention with a learnable per-head attention-sink logit.
+
+    The sink acts as one virtual key per query with logit `sink[h]` and a zero
+    value vector: it takes softmax mass without contributing to the output,
+    giving heads a no-op escape when nothing in the (windowed) context is
+    relevant. Folding it in only requires the log-sum-exp the kernel already
+    computes:
+
+      forward:  lse_m = logaddexp(lse, sink);  out_m = out * exp(lse - lse_m)
+      backward: the stock kernel rebuilds p_ij = exp(s_ij - lse) from whatever
+                lse it is given, so passing (out_m, lse_m) makes it reconstruct
+                exactly the sinked distribution. The sink's zero value keeps
+                the softmax-Jacobian rowsum dout.out_m complete, so dq/dk/dv
+                are exact, and dsink reduces to a closed form.
+
+    Cost over the vanilla path: elementwise ops only — no extra attention.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, sink, cu_seqlens, max_seqlen, window_left, softmax_scale):
+        out, lse, _, _ = _flash_attn_varlen_forward(
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+            0.0, softmax_scale, True, window_left, 0,
+        )
+        lse_m = torch.logaddexp(lse, sink.float()[:, None])  # [heads, total_q]
+        out = out * rearrange(torch.exp(lse - lse_m), "h t -> t h 1").to(out.dtype)
+        ctx.save_for_backward(q, k, v, sink, out, lse_m, cu_seqlens)
+        ctx.max_seqlen = max_seqlen
+        ctx.window_left = window_left
+        ctx.softmax_scale = softmax_scale
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, sink, out, lse_m, cu_seqlens = ctx.saved_tensors
+        dout = dout.contiguous()
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        _flash_attn_varlen_backward(
+            dout, q, k, v, out, lse_m, dq, dk, dv, cu_seqlens, cu_seqlens,
+            ctx.max_seqlen, ctx.max_seqlen, 0.0, ctx.softmax_scale, True,
+            ctx.window_left, 0, 0.0, None, False, None,
+        )
+        rowsum = (dout.float() * out.float()).sum(-1)  # [total_q, heads]
+        dsink = -(torch.exp(sink.float()[:, None] - lse_m) * rowsum.T).sum(-1)
+        return dq, dk, dv, dsink.to(sink.dtype), None, None, None, None
 
 
 class GatedAttention(nn.Module):
@@ -48,6 +108,21 @@ class GatedAttention(nn.Module):
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
 
+        self.use_attention_sink = config.use_attention_sink
+        if self.use_attention_sink:
+            if not _SINK_FA_COMPATIBLE:
+                raise RuntimeError(
+                    "use_attention_sink drives flash-attn internal varlen kernels whose "
+                    f"signatures are only validated on 2.7-2.8; found {flash_attn.__version__}. "
+                    "Re-validate _SinkFlashAttnVarlen against the new signatures before lifting "
+                    "this check."
+                )
+            # Raw logit of the virtual zero-value sink key, one per query head.
+            # Zero-init: the sink starts with the weight of one average key.
+            self.attn_sink = nn.Parameter(torch.zeros(self.num_heads))
+        else:
+            self.attn_sink = None
+
         self.reset_parameters()
 
         self.pos_rope_dims = config.pos_rope_dims
@@ -72,6 +147,8 @@ class GatedAttention(nn.Module):
         nn.init.normal_(self.v_proj.weight, mean=0.0, std=self.initializer_range)
         nn.init.normal_(self.o_proj.weight, mean=0.0, std=self.initializer_range)
         nn.init.normal_(self.head_gate_proj.weight, mean=0.0, std=self.initializer_range)
+        if self.attn_sink is not None:
+            nn.init.zeros_(self.attn_sink)
 
     def _build_pos_rope_tables(self, max_position_embeddings, head_dim, base, dtype, device):
         """Build RoPE tables shaped [max_pos, head_dim / 2]."""
@@ -114,18 +191,30 @@ class GatedAttention(nn.Module):
         k = rearrange(key_states, "b s h d -> (b s) h d")
         v = rearrange(value_states, "b s h d -> (b s) h d")
 
-        attn_output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            dropout_p=0.0,
-            causal=True,
-            window_size=self.window,
-        )
+        if self.attn_sink is not None:
+            attn_output = _SinkFlashAttnVarlen.apply(
+                q,
+                k,
+                v,
+                self.attn_sink,
+                cu_seqlens,
+                max_seqlen,
+                self.window[0],
+                self.head_dim ** -0.5,
+            )
+        else:
+            attn_output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                dropout_p=0.0,
+                causal=True,
+                window_size=self.window,
+            )
         return rearrange(attn_output, "(b s) h d -> b s h d", b=bsz)
 
     def forward(

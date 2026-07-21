@@ -2,6 +2,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .transformer_block import TransformerBlock
 
@@ -67,6 +68,21 @@ class MoEModel(nn.Module):
     def tie_weights(self):
         self.output_layer.weight = self.embedding.weight
 
+    def compile_blockwise(self, **compile_kwargs):
+        """Compile each transformer block and engram read/inject as separate
+        graphs rather than the whole forward. A single joint graph puts every
+        checkpointed block's backward recompute into one inductor schedule,
+        whose buffer live-ranges overlap and multiply backward peak memory
+        (~2.5x measured); per-block graphs keep autograd's sequential
+        recompute-then-free, at equal or better step time.
+        """
+        for layer in self.layers:
+            layer.compile(**compile_kwargs)
+        if self.engrams is not None:
+            for engram in self.engrams.values():
+                engram.read = torch.compile(engram.read, **compile_kwargs)
+                engram.inject = torch.compile(engram.inject, **compile_kwargs)
+
     def _embed_tokens(self, x):
         emb = self.embedding(x)
         if not self.tie_word_embeddings:
@@ -97,20 +113,33 @@ class MoEModel(nn.Module):
         all_topk_indices = []
         apply_engram = self.engrams is not None and token_ids is not None and token_ids.dim() == 2
         # Memory readouts depend only on the token stream, so an engram tied across
-        # several layers reads its table once; only the gate runs per layer.
+        # several layers reads its table once; only the gate runs per layer. Both
+        # halves are checkpointed: the read's gather/norm/projection intermediates
+        # and the gate's fp32 intermediates are large but cheap to recompute, so
+        # only the read outputs (delta, normed_key) stay live across the network,
+        # shared by every injection site.
         engram_reads = {}
         for layer_idx, layer in enumerate(self.layers):
             if apply_engram:
                 for key in self._engrams_at.get(layer_idx, ()):
                     engram = self.engrams[key]
                     if key not in engram_reads:
-                        engram_reads[key] = engram.read(token_ids, position_ids)
-                    x = engram.inject(x, *engram_reads[key])
-            x, topk_idx = layer(
+                        engram_reads[key] = checkpoint(
+                            engram.read, token_ids, position_ids,
+                            use_reentrant=False,
+                        )
+                    x = checkpoint(engram.inject, x, *engram_reads[key],
+                                   use_reentrant=False)
+            # The whole block (attention included) is checkpointed — only the
+            # block input stays live per layer; the block itself must not nest
+            # its own checkpoint calls.
+            x, topk_idx = checkpoint(
+                layer,
                 x,
                 position_ids=position_ids,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                use_reentrant=False,
             )
             all_topk_indices.append(topk_idx)
         return x, all_topk_indices

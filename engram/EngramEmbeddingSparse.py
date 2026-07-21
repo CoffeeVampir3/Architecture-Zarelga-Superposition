@@ -195,9 +195,14 @@ class EngramEmbeddingSparse(nn.Module):
              position_ids: torch.Tensor | None = None) -> tuple:
         """Token-addressed memory readout, independent of the residual stream.
 
-        Returns ``(delta, key)`` with ``key`` None outside context_gate mode. When
-        one engram is weight-tied across several layers, call this once and feed
-        the result to ``inject`` at each layer.
+        Returns ``(delta, normed_key)`` with ``normed_key`` None outside
+        context_gate mode. The key is RMS-normed here (fp32 math) rather than in
+        ``inject``: it has no dependence on the residual stream, so a weight-tied
+        engram normalizes it once instead of once per injection site. It is
+        returned in ``delta``'s dtype (bf16 under autocast) — both outputs may be
+        held live across every injection site, so they stay compact and ``inject``
+        upcasts for the gate math. Call this once and feed the result to
+        ``inject`` at each layer.
         """
         cids = self.token_canon[token_ids.to(torch.int64)]
         addr = self._addresses(cids, self.multipliers, position_ids) + self.offsets  # [B, T, H_total]
@@ -209,17 +214,19 @@ class EngramEmbeddingSparse(nn.Module):
             e = e / e.norm(dim=-1, keepdim=True).clamp_min(1.0)  # bounds value_proj input; zeros stay zero
         flat = e.flatten(start_dim=-2)
         delta = self.value_proj(flat)                            # [B, T, d_model]
-        key = self.key_proj(flat) if self.gate_mode == "context_gate" else None
-        return delta, key
+        if self.gate_mode == "context_gate":
+            normed_key = self.key_norm(self.key_proj(flat).float()).to(delta.dtype)
+        else:
+            normed_key = None
+        return delta, normed_key
 
     def inject(self, hidden_states: torch.Tensor, delta: torch.Tensor,
-               key: torch.Tensor | None) -> torch.Tensor:
+               normed_key: torch.Tensor | None) -> torch.Tensor:
         """Gate a memory readout from ``read`` into the residual stream."""
         delta = delta.to(hidden_states.dtype)
         if self.gate_mode == "context_gate":
-            normed_key = self.key_norm(key.float())
             normed_query = self.query_norm(hidden_states.float())
-            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(float(self.config.d_model))
+            gate = (normed_key.float() * normed_query).sum(dim=-1) / math.sqrt(float(self.config.d_model))
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()   # signed-sqrt squash
             gate = gate.sigmoid().unsqueeze(-1).to(hidden_states.dtype)
             if self.training:
@@ -233,5 +240,5 @@ class EngramEmbeddingSparse(nn.Module):
                 token_ids: torch.Tensor,
                 position_ids: torch.Tensor | None = None) -> torch.Tensor:
         """hidden_states: [B, T, d_model]; token_ids: [B, T] -> [B, T, d_model]."""
-        delta, key = self.read(token_ids, position_ids)
-        return self.inject(hidden_states, delta, key)
+        delta, normed_key = self.read(token_ids, position_ids)
+        return self.inject(hidden_states, delta, normed_key)

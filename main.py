@@ -54,13 +54,19 @@ class PackedTokenizedCollator:
     """Concatenate records into one flat unpadded token stream.
 
     Returns input_ids/position_ids as [1, total_tokens], labels as [total_tokens],
-    and cu_seqlens as [num_segments + 1].
+    and cu_seqlens as [num_segments + 1]. With ``max_total_tokens`` set, packing
+    stops at that budget — the crossing record is truncated and later records are
+    dropped — so a rare batch of all-long records cannot inflate peak activation
+    memory beyond what typical batches need. The dropped amount is returned as
+    ``overflow_tokens`` for monitoring.
     """
 
-    def __init__(self, max_length, pad_token_id, ignore_index=-100):
+    def __init__(self, max_length, pad_token_id, ignore_index=-100,
+                 max_total_tokens=None):
         self.max_length = max_length
         self.pad_token_id = pad_token_id
         self.ignore_index = ignore_index
+        self.max_total_tokens = max_total_tokens
 
     def __call__(self, examples):
         flat_token_ids = []
@@ -68,6 +74,7 @@ class PackedTokenizedCollator:
         flat_labels = []
         cu_seqlens = [0]
         max_seqlen = 0
+        overflow_tokens = 0
 
         for example in examples:
             token_ids = example["token_ids"]
@@ -75,6 +82,15 @@ class PackedTokenizedCollator:
                 token_ids = token_ids[:self.max_length]
             if not token_ids:
                 continue
+
+            if self.max_total_tokens is not None:
+                remaining = self.max_total_tokens - cu_seqlens[-1]
+                if remaining < 2:  # a 1-token segment has no trainable position
+                    overflow_tokens += len(token_ids)
+                    continue
+                if len(token_ids) > remaining:
+                    overflow_tokens += len(token_ids) - remaining
+                    token_ids = token_ids[:remaining]
 
             segment_len = len(token_ids)
             flat_token_ids.extend(token_ids)
@@ -98,6 +114,7 @@ class PackedTokenizedCollator:
             "labels": labels,
             "cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32),
             "max_seqlen": bucketed_max_seqlen,
+            "overflow_tokens": overflow_tokens,
         }
 
 def load_and_preprocess_data(data_dir="outputs", max_length=ModelConfig.sequence_length):
@@ -380,7 +397,10 @@ def train(
         capture_warmup_steps=training.capture_warmup_steps,
     )
 
-    collator = PackedTokenizedCollator(sequence_length, tokenizer.pad_token_id)
+    collator = PackedTokenizedCollator(
+        sequence_length, tokenizer.pad_token_id,
+        max_total_tokens=training.max_tokens_per_batch,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -416,6 +436,7 @@ def train(
         'adam_lr': adam_lr,
         'num_epochs': num_epochs,
         'sequence_length': sequence_length,
+        'max_tokens_per_batch': training.max_tokens_per_batch,
         'update_rate': update_rate,
         'z_loss_coef': z_loss_coef,
         'optimizer': 'SingleDeviceMuonMDWithAuxAdam (capturable / CUDA-graph)',
@@ -564,6 +585,7 @@ def train(
             metrics["mem/num_tokens"] = num_tokens
             metrics["mem/total_tokens_processed"] = total_tokens_processed
             metrics["mem/num_segments"] = num_segments
+            metrics["mem/overflow_tokens"] = batch["overflow_tokens"]
             metrics.update(logger.log_engram_metrics(
                 global_step, detailed=detailed_logging))
             logger.log(metrics, step=global_step, model=model, detailed_logging=detailed_logging)
@@ -623,7 +645,7 @@ def main():
         print(f"Engram tokenizer compression: {merged}/{len(tokenizer)} token IDs merged")
 
     count_parameters_layerwise(model)
-    model.headless_forward = torch.compile(model.headless_forward, dynamic=True)
+    model.compile_blockwise(dynamic=True)
     train(
         model,
         train_dataset,

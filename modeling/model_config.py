@@ -99,6 +99,12 @@ class ModelConfig:
 
     use_qk_norm: bool = True
 
+    # Learnable per-head attention-sink logit (a virtual zero-value key that
+    # only enlarges the softmax denominator). Gives heads a no-op escape when
+    # nothing in context is relevant — matters most for SWA layers, where the
+    # window evicts the early tokens a sink would otherwise form on naturally.
+    use_attention_sink: bool = False
+
     hca_block_size: int = 128
     hca_window_size: int = 128
 

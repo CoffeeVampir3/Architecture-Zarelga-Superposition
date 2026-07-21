@@ -22,7 +22,7 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
         transformer_depth=8,
 
         first_k_dense_replace=8,
-        dense_intermediate_size=1792,
+        dense_intermediate_size=1024 + 256,
         intermediate_size=160,
         n_experts=34,
         n_shared_experts=2,
@@ -30,8 +30,9 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
 
         n_attention_heads=8,
         n_key_value_heads=4,
-        attention_window_pattern=(256, 256, 256, None, 512, 512, 512, None),
+        attention_window_pattern=(64, 64, 64, None, 128, 128, 128, None),
         use_qk_norm=True,
+        use_attention_sink=True,
 
         rms_norm_eps=1e-6,
         max_position_embeddings=8192,
@@ -43,14 +44,14 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
 
         # Ablation-accepted configuration (runs/engram_ablating/EXPERIMENT_REPORT.md):
         # context gate + shrink-only row-norm cap, no forward-noise curriculum.
-        # One weight-tied engram shared by the first sliding-window layers 0-2:
-        # the token-addressed readout is computed once; each layer applies its
-        # own context gate.
+        # One weight-tied engram shared by layers 1-7; layer 0 remains
+        # embedding-only before attention. The token-addressed readout is
+        # computed once; each layer applies its own context gate.
         engram=EngramSettings(
-            layers={0: (0, 1, 2)},
+            layers={0: (1,2,3,5,6,7)},
             orders=(2, 3),
             n_heads=4,
-            rows_per_head=65000,
+            rows_per_head=1_920_000,
             dim_per_head=64,
             importance_weighting=True,
             head_norm=True,
@@ -93,9 +94,15 @@ SQRT2 = 2 ** 0.5
 class TrainingConfig:
     # --- schedule / data ---
     num_epochs: int = 1
-    batch_size: int = 26
+    batch_size: int = 32
     num_workers: int = 4
     prefetch_factor: int = 2
+    # Hard cap on packed tokens per batch. Records average ~5-6k tokens, so
+    # batches concentrate near batch_size * 6k; without a cap, peak memory must
+    # be provisioned for the rare batch of all sequence_length-sized records
+    # (batch_size * 8192). Overflow is truncated/dropped and logged. None
+    # disables the cap.
+    max_tokens_per_batch: Optional[int] = batch_size * 6144
 
     # --- learning rates (Muon / Adam paths) ---
     muon_lr: float = 0.02 * SQRT2
