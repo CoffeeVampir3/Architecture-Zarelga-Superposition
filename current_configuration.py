@@ -30,9 +30,13 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
 
         n_attention_heads=8,
         n_key_value_heads=4,
-        attention_window_pattern=(64, 64, 64, None, 128, 128, 128, None),
+        attention_window_pattern=(128, 128, 128, None, 128, 128, 128, None),
         use_qk_norm=True,
         use_attention_sink=True,
+
+        # Depth-wise softmax residuals; the engram readout becomes a
+        # depth-attention value source (no context gate, no stream injections).
+        attn_res=True,
 
         rms_norm_eps=1e-6,
         max_position_embeddings=8192,

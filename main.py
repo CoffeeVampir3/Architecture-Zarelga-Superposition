@@ -455,6 +455,7 @@ def train(
         'max_rolling_checkpoints': max_rolling_checkpoints,
         'attention/do_rope': model.config.do_rope,
         'attention/pos_rope_dims': model.config.pos_rope_dims,
+        'attn_res': model.config.attn_res,
         'engram/enabled': model.config.engram.enabled,
         'engram/layers': {str(eid): list(group)
                           for eid, group in model.config.engram.layers.items()},
@@ -588,6 +589,7 @@ def train(
             metrics["mem/overflow_tokens"] = batch["overflow_tokens"]
             metrics.update(logger.log_engram_metrics(
                 global_step, detailed=detailed_logging))
+            metrics.update(logger.log_attn_res_metrics(model))
             logger.log(metrics, step=global_step, model=model, detailed_logging=detailed_logging)
 
         if checkpoint_interval_steps > 0 and (

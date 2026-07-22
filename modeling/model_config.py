@@ -108,6 +108,13 @@ class ModelConfig:
     hca_block_size: int = 128
     hca_window_size: int = 128
 
+    # Attention Residuals (arXiv:2603.15031): replace the additive residual
+    # stream with per-site softmax attention over depth-wise sources
+    # [embedding, engram delta(s), block deltas]. The engram readout becomes a
+    # depth-attention value source instead of a gated stream injection (its
+    # context gate is not built), and site 0 stays embedding-only.
+    attn_res: bool = False
+
     rms_norm_eps: float = 1e-6
     max_position_embeddings: int = 4096
     sequence_length: int = 4096

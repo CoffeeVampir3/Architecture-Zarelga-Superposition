@@ -7,6 +7,7 @@ from torch.utils.checkpoint import checkpoint
 from .transformer_block import TransformerBlock
 
 from .attention import GatedAttention
+from .attn_res import DepthAttnRes
 from .zRMSNorm import ZeroCenteredRMSNorm
 
 from engram.EngramEmbeddingSparse import EngramConfig, EngramEmbeddingSparse
@@ -15,6 +16,7 @@ class MoEModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.attn_res = bool(getattr(config, "attn_res", False))
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, sparse=True)
 
         self.layers = nn.ModuleList(
@@ -52,6 +54,16 @@ class MoEModel(nn.Module):
             self.engrams = None
             self._engrams_at = {}
 
+        if self.attn_res:
+            self.depth_mixer = DepthAttnRes(
+                config.hidden_size,
+                n_sites=len(self.layers) + 1,  # one per block + the final head mix
+                max_sources=1 + len(self.engram_map) + len(self.layers),
+                eps=config.rms_norm_eps,
+            )
+        else:
+            self.depth_mixer = None
+
         self.reset_parameters()
         if self.tie_word_embeddings:
             self.tie_weights()
@@ -82,6 +94,10 @@ class MoEModel(nn.Module):
             for engram in self.engrams.values():
                 engram.read = torch.compile(engram.read, **compile_kwargs)
                 engram.inject = torch.compile(engram.inject, **compile_kwargs)
+        if self.depth_mixer is not None:
+            # Site index and source count are compile-time constants per call
+            # site, so each of the depth+1 mixes gets its own small graph.
+            self.depth_mixer.compile(**compile_kwargs)
 
     def _embed_tokens(self, x):
         emb = self.embedding(x)
@@ -90,6 +106,11 @@ class MoEModel(nn.Module):
         return emb
 
     def _build_engram(self, config, engram_id):
+        # Under AttnRes the readout is a depth-attention value source; the
+        # context gate (and its key projection) is never used, so build the
+        # module in the parameter-free fixed_alpha mode. read() then returns
+        # (delta, None) without computing a key.
+        gate_mode = "fixed_alpha" if self.attn_res else config.engram.gate_mode
         engram = EngramEmbeddingSparse(EngramConfig(
             vocab_size=config.vocab_size,
             d_model=config.hidden_size,
@@ -102,14 +123,63 @@ class MoEModel(nn.Module):
             alpha_init=config.engram.alpha_init,
             importance_weighting=config.engram.importance_weighting,
             head_norm=config.engram.head_norm,
-            gate_mode=config.engram.gate_mode,
+            gate_mode=gate_mode,
         ))
         nn.init.normal_(engram.value_proj.weight, mean=0.0, std=config.initializer_range)
         if getattr(engram, "key_proj", None) is not None:
             nn.init.normal_(engram.key_proj.weight, mean=0.0, std=config.initializer_range)
         return engram
 
+    def _mixed_block_step(self, layer_idx, values, position_ids, cu_seqlens, max_seqlen):
+        """One AttnRes site: mix the sources, run the block, emit the block delta.
+
+        Checkpointed as a unit so the mixed input h is recomputed in backward —
+        only the shared source list stays live across the network.
+        """
+        h = self.depth_mixer(layer_idx, values)
+        out, topk_idx = self.layers[layer_idx](
+            h,
+            position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        return out - h, topk_idx
+
+    def _run_layers_attn_res(self, x, token_ids, position_ids, cu_seqlens, max_seqlen):
+        all_topk_indices = []
+        apply_engram = self.engrams is not None and token_ids is not None and token_ids.dim() == 2
+        # Engram deltas are depth-attention value sources, not stream
+        # injections: the tied readout is computed once and every later site
+        # retrieves it through its softmax weight. Site 0 sees only the
+        # embedding (the ablation-accepted "layer 0 is embedding-only").
+        sources = [x]
+        if apply_engram:
+            for key in sorted(self.engrams.keys(), key=int):
+                delta, _ = checkpoint(self.engrams[key].read, token_ids, position_ids,
+                                      use_reentrant=False)
+                sources.append(delta.to(x.dtype))
+        n_static = len(sources)  # embedding + engram sources
+        for layer_idx in range(len(self.layers)):
+            if layer_idx == 0:
+                site_values = sources[:1]
+            else:
+                site_values = sources[: n_static + layer_idx]
+            delta, topk_idx = checkpoint(
+                self._mixed_block_step, layer_idx, site_values,
+                position_ids, cu_seqlens, max_seqlen,
+                use_reentrant=False,
+            )
+            sources.append(delta)
+            all_topk_indices.append(topk_idx)
+        x = checkpoint(self.depth_mixer, len(self.layers), sources,
+                       use_reentrant=False)
+        return x, all_topk_indices
+
     def _run_layers(self, x, token_ids, position_ids, cu_seqlens, max_seqlen):
+        if self.attn_res:
+            return self._run_layers_attn_res(
+                x, token_ids, position_ids, cu_seqlens, max_seqlen
+            )
         all_topk_indices = []
         apply_engram = self.engrams is not None and token_ids is not None and token_ids.dim() == 2
         # Memory readouts depend only on the token stream, so an engram tied across

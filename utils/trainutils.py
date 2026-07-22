@@ -197,6 +197,31 @@ class AimLogger:
 
         return metrics
 
+    def log_attn_res_metrics(self, model):
+        """Mean depth-attention mixing weight per (site, source).
+
+        Source order matches the model's value list: embedding, engram ids
+        ascending, then block deltas. Site 0 is embedding-only (never mixed)
+        and is skipped; the last site is the final head mix.
+        """
+        mixer = getattr(model, 'depth_mixer', None)
+        if mixer is None:
+            return {}
+        alpha = mixer.last_alpha_mean.detach().cpu()
+        n_sites = alpha.shape[0]
+        depth = n_sites - 1
+        engram_ids = sorted(getattr(model, 'engram_map', {}) or {})
+        labels = (['embed']
+                  + [f'engram{eid}' for eid in engram_ids]
+                  + [f'block{j}' for j in range(depth)])
+        metrics = {}
+        for site in range(1, n_sites):
+            site_name = 'head' if site == depth else f'L{site}'
+            n_sources = 1 + len(engram_ids) + site
+            for i in range(n_sources):
+                metrics[f'attn_res/{site_name}/{labels[i]}'] = alpha[site, i].item()
+        return metrics
+
     def log_training_metrics(self, loss, optimizer, update_rate):
         metrics = {
             'loss/batch_loss': loss.item() if torch.is_tensor(loss) else loss,
