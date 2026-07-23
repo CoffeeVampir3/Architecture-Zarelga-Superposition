@@ -17,8 +17,8 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
         vocab_size=vocab_size,
         pad_token_id=pad_token_id,
 
-        embed_size=512,
-        hidden_size=512,
+        embed_size=640,
+        hidden_size=640,
         transformer_depth=8,
 
         first_k_dense_replace=8,
@@ -43,7 +43,8 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
         sequence_length=8192,
         rope_theta=100000,
         do_rope=True,
-        tie_word_embeddings=False,
+        # One dense table supplies normalized token inputs and the raw LM head.
+        tie_word_embeddings=True,
         pos_rope_dims=16,
 
         # Ablation-accepted configuration (runs/engram_ablating/EXPERIMENT_REPORT.md):
@@ -112,14 +113,14 @@ class TrainingConfig:
     muon_lr: float = 0.02 * SQRT2
     adam_lr: float = 3e-4 * SQRT2
     gain_lr: float = 1e-3 * SQRT2
-    embedding_lr: float = 3e-3 * SQRT2
+    engram_lr: float = 3e-3 * SQRT2
 
     # --- optimizer hyperparameters ---
     muon_momentum: float = 0.95
     adam_betas: Tuple[float, float] = (0.9, 0.95)
     adam_eps: float = 1e-16
-    embedding_beta: float = 0.9
-    head_weight_decay: float = 0.1  # decoupled WD on the (untied) LM head; input embedding is unit-norm instead
+    engram_beta: float = 0.9
+    head_weight_decay: float = 0.1  # decoupled WD on the tied token table / LM head
     norm_weight_decay: float = 0.1
     capture_warmup_steps: int = 5
 

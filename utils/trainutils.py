@@ -64,6 +64,12 @@ def load_checkpoint(model, optimizer, filename="checkpoint.safetensors", schedul
 
     base = model._orig_mod if hasattr(model, '_orig_mod') else model
     tied = getattr(base, 'tie_word_embeddings', False)
+    checkpoint_tied = 'output_layer.weight' not in model_state
+    if checkpoint_tied != tied:
+        raise ValueError(
+            "checkpoint/model weight-tying mismatch: build the model with "
+            f"tie_word_embeddings={checkpoint_tied} before restoring optimizer state"
+        )
     base.load_state_dict(model_state, strict=not tied)
     if tied:
         base.tie_weights()
@@ -333,7 +339,7 @@ class AimLogger:
                 param_stats_by_layer[layer_num]['std_sum'] += param_std
                 param_stats_by_layer[layer_num]['count'] += 1
 
-            # Skip sparse-gradient params (the nn.Embedding(sparse=True) table): the
+            # Skip sparse-gradient params (the Engram nn.Embedding tables): the
             # dense reductions below aren't registered for the Sparse backend, and
             # coalescing + reducing would add host syncs to a diagnostic. The embedding
             # weight-norm stats above still log; only its grad stats are dropped.

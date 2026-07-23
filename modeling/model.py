@@ -2,6 +2,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .transformer_block import TransformerBlock
@@ -17,7 +18,10 @@ class MoEModel(nn.Module):
         super().__init__()
         self.config = config
         self.attn_res = bool(getattr(config, "attn_res", False))
-        self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, sparse=True)
+        # The token table is also the LM classifier when weight tying is enabled.
+        # Classifier loss produces a dense [vocab, hidden] gradient, so this table
+        # must use the ordinary dense optimizer path. Engram tables remain sparse.
+        self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, sparse=False)
 
         self.layers = nn.ModuleList(
             [
@@ -98,12 +102,24 @@ class MoEModel(nn.Module):
             # Site index and source count are compile-time constants per call
             # site, so each of the depth+1 mixes gets its own small graph.
             self.depth_mixer.compile(**compile_kwargs)
+            self.depth_mixer.source_logits = torch.compile(
+                self.depth_mixer.source_logits, **compile_kwargs
+            )
 
     def _embed_tokens(self, x):
-        emb = self.embedding(x)
-        if not self.tie_word_embeddings:
-            emb = emb * (self.config.hidden_size ** 0.5)
-        return emb
+        # The raw shared rows are free to learn useful classifier magnitudes.
+        # Normalize only their input-facing view, preserving the previous unit-row
+        # embedding geometry and the sqrt(d) AttnRes value scale. For large packed
+        # batches it is cheaper to normalize V rows once than the same rows once per
+        # token; autoregressive inference takes the gathered-row path instead.
+        weight = self.embedding.weight
+        if x.numel() >= weight.shape[0]:
+            normalized_weight = F.normalize(weight.float(), dim=-1, eps=1e-12)
+            emb = F.embedding(x, normalized_weight.to(weight.dtype))
+        else:
+            emb = self.embedding(x)
+            emb = F.normalize(emb.float(), dim=-1, eps=1e-12).to(emb.dtype)
+        return emb * (self.config.hidden_size ** 0.5)
 
     def _build_engram(self, config, engram_id):
         # Under AttnRes the readout is a depth-attention value source; the
@@ -130,20 +146,21 @@ class MoEModel(nn.Module):
             nn.init.normal_(engram.key_proj.weight, mean=0.0, std=config.initializer_range)
         return engram
 
-    def _mixed_block_step(self, layer_idx, values, position_ids, cu_seqlens, max_seqlen):
+    def _mixed_block_step(self, layer_idx, values, logits, position_ids, cu_seqlens, max_seqlen):
         """One AttnRes site: mix the sources, run the block, emit the block delta.
 
         Checkpointed as a unit so the mixed input h is recomputed in backward —
-        only the shared source list stays live across the network.
+        only the shared source list (and its tiny precomputed logits) stays
+        live across the network.
         """
-        h = self.depth_mixer(layer_idx, values)
-        out, topk_idx = self.layers[layer_idx](
+        h = self.depth_mixer(layer_idx, values, logits)
+        delta, topk_idx = self.layers[layer_idx](
             h,
             position_ids=position_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
-        return out - h, topk_idx
+        return delta, topk_idx
 
     def _run_layers_attn_res(self, x, token_ids, position_ids, cu_seqlens, max_seqlen):
         all_topk_indices = []
@@ -152,26 +169,34 @@ class MoEModel(nn.Module):
         # injections: the tied readout is computed once and every later site
         # retrieves it through its softmax weight. Site 0 sees only the
         # embedding (the ablation-accepted "layer 0 is embedding-only").
+        # Each source is normalized and scored against every site's query once
+        # when it enters the pool (checkpointed: only the [B, T, n_sites]
+        # logits are retained).
         sources = [x]
         if apply_engram:
             for key in sorted(self.engrams.keys(), key=int):
                 delta, _ = checkpoint(self.engrams[key].read, token_ids, position_ids,
                                       use_reentrant=False)
                 sources.append(delta.to(x.dtype))
+        logits = [checkpoint(self.depth_mixer.source_logits, v, use_reentrant=False)
+                  for v in sources]
         n_static = len(sources)  # embedding + engram sources
         for layer_idx in range(len(self.layers)):
             if layer_idx == 0:
-                site_values = sources[:1]
+                n_site = 1
             else:
-                site_values = sources[: n_static + layer_idx]
+                n_site = n_static + layer_idx
             delta, topk_idx = checkpoint(
-                self._mixed_block_step, layer_idx, site_values,
+                self._mixed_block_step, layer_idx,
+                sources[:n_site], logits[:n_site],
                 position_ids, cu_seqlens, max_seqlen,
                 use_reentrant=False,
             )
             sources.append(delta)
+            logits.append(checkpoint(self.depth_mixer.source_logits, delta,
+                                     use_reentrant=False))
             all_topk_indices.append(topk_idx)
-        x = checkpoint(self.depth_mixer, len(self.layers), sources,
+        x = checkpoint(self.depth_mixer, len(self.layers), sources, logits,
                        use_reentrant=False)
         return x, all_topk_indices
 

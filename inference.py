@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 from transformers import PreTrainedTokenizerFast
 
@@ -145,6 +146,16 @@ def main():
 
     tokenizer = load_tokenizer(args.tokenizer)
     config = build_config(len(tokenizer), tokenizer.pad_token_id)
+
+    # Older checkpoints from the currently running untied experiment contain a
+    # separate output tensor; tied checkpoints omit that duplicate. Detect this
+    # before model construction so both generations remain loadable.
+    with safe_open(str(args.checkpoint), framework="pt", device="cpu") as f:
+        checkpoint_tied = "output_layer.weight" not in f.keys()
+    if checkpoint_tied != config.tie_word_embeddings:
+        mode = "tied" if checkpoint_tied else "untied"
+        print(f"Checkpoint uses {mode} token weights; matching its architecture.")
+        config.tie_word_embeddings = checkpoint_tied
 
     load_device = "cpu" if args.cpu_offload else device
 

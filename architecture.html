@@ -126,7 +126,7 @@
   <!-- ======= embedding ======= -->
   <rect x="250" y="92" width="260" height="52" rx="9" fill="var(--c-id-soft)" stroke="var(--c-id)"/>
   <text x="380" y="113" text-anchor="middle" class="ttl">Embedding</text>
-  <text x="380" y="131" text-anchor="middle" class="sm">16,384 × 512 · unit-norm rows · ×√512 · sparse-grad</text>
+  <text x="380" y="131" text-anchor="middle" class="sm">16,384 × 512 · normalized input view · ×√512 · dense-grad</text>
 
   <!-- ======= engram side card ======= -->
   <rect x="26" y="92" width="184" height="196" rx="10" fill="var(--c-mem-soft)" stroke="var(--c-mem)"/>
@@ -277,8 +277,8 @@
   <text x="380" y="1150" text-anchor="middle" class="lbl">zRMSNorm</text>
   <line x1="380" y1="1162" x2="380" y2="1176" stroke="var(--c-head)" stroke-width="1.8" marker-end="url(#aInk)"/>
   <rect x="250" y="1180" width="260" height="52" rx="9" fill="var(--c-head-soft)" stroke="var(--c-head)"/>
-  <text x="380" y="1201" text-anchor="middle" class="ttl">LM head (untied)</text>
-  <text x="380" y="1219" text-anchor="middle" class="sm">512 × 16,384 · cut-cross-entropy + z-loss</text>
+  <text x="380" y="1201" text-anchor="middle" class="ttl">LM head (tied)</text>
+  <text x="380" y="1219" text-anchor="middle" class="sm">shared raw token table · cut-cross-entropy + z-loss</text>
 
   <!-- legend -->
   <g transform="translate(26, 1180)">
@@ -299,10 +299,10 @@
   <div class="card">
     <h3><span class="dot" style="background:var(--c-mix)"></span>Depth mix (AttnRes)</h3>
     <p>At site <span class="m">l</span>, over sources <span class="m">v₀…v_{l-1+m}</span>:</p>
-    <div class="eq">h_l = Σᵢ αᵢ·vᵢ,&nbsp;&nbsp; αᵢ = softmaxᵢ( w_l · zRMSNorm(vᵢ) )</div>
+    <div class="eq">h_l = Σᵢ αᵢ·vᵢ,&nbsp;&nbsp; αᵢ = softmaxᵢ( w_l · v̂ᵢ ),&nbsp;&nbsp; v̂ = v / rms(v)</div>
     <ul>
-      <li><b>w_l</b>: one 512-d pseudo-query per site, <b>zero-init</b> → every site starts as a uniform average (paper's stability requirement). 9 sites = 8 pre-block + 1 pre-head; 9,216 params total.</li>
-      <li>Keys RMS-normed in fp32 so no source wins by magnitude; <b>values enter raw</b> — a source's scale is carried by the source itself (e.g. the engram's <span class="m">value_proj</span>).</li>
+      <li><b>w_l</b>: one 512-d pseudo-query per site, <b>zero-init</b> → every site starts as a uniform average (paper's stability requirement). 9 sites = 8 pre-block + 1 pre-head; 4,608 params total. The paper's per-site key-norm gain folds into the query exactly (w·(g⊙v̂) ≡ (w⊙g)·v̂), so each source is normalized <b>once</b>, on entering the pool, and scored against all 9 queries in a single matvec.</li>
+      <li>Keys normalized in fp32 so no source wins by magnitude; <b>values enter raw</b> — a source's scale is carried by the source itself (e.g. the engram's <span class="m">value_proj</span>).</li>
       <li>Weights are <b>per-token</b> (input-dependent through keys), single head — both per the paper's ablations.</li>
       <li>Site 0 is embedding-only (preserves the ablation-accepted "layer 0 sees only the embedding").</li>
       <li>Replaces the engram's sigmoid context gate with softmax competition; mean α per (site, source) logged to Aim as <span class="m">attn_res/L*/…</span>.</li>
@@ -350,11 +350,10 @@
       <tr><td>Engram tables (8 × ~1.92M × 64)</td><td class="num">983M</td></tr>
       <tr><td>Engram importance tables (8 × ~1.92M × 1)</td><td class="num">15.4M</td></tr>
       <tr><td>Engram value_proj</td><td class="num">0.3M</td></tr>
-      <tr><td>Token embedding (16,384 × 512)</td><td class="num">8.4M</td></tr>
-      <tr><td>LM head, untied (512 × 16,384)</td><td class="num">8.4M</td></tr>
+      <tr><td>Tied token embedding / LM head (16,384 × 512)</td><td class="num">8.4M</td></tr>
       <tr><td>8 transformer blocks (attn + SwiGLU)</td><td class="num">22.1M</td></tr>
-      <tr><td>Depth mixer (9 queries + 9 key-norms)</td><td class="num">9.2K</td></tr>
-      <tr class="total"><td>Total (≈96% memory, ≈2% compute-bearing)</td><td class="num">≈1.04B</td></tr>
+      <tr><td>Depth mixer (9 site queries)</td><td class="num">4.6K</td></tr>
+      <tr class="total"><td>Total (≈97% memory, ≈2% compute-bearing)</td><td class="num">≈1.03B</td></tr>
     </table>
     <p class="note">Tables are bf16 ≈ 2.0 GB resident; per-step cost independent of table size (sparse gather/scatter of ≤ 8 rows/token).</p>
   </div>
@@ -364,7 +363,7 @@
     <ul>
       <li><b>Data</b>: pre-tokenized docs packed into one flat varlen stream; hard cap 196,608 tokens/batch (32 × 6,144; overflow truncated &amp; logged) — bounds peak memory against rare all-long batches.</li>
       <li><b>Loss</b>: cut-cross-entropy (no logit materialization) + z-loss 1e-4 over valid tokens.</li>
-      <li><b>Optimizers</b>: Muon-MD for 2-D weights, Adam for head/scalars/norm gains, GramReaperSparse (per-row RMSProp, fp32 scalar state) for embedding + engram tables; CUDA-graph captured.</li>
+      <li><b>Optimizers</b>: Muon-MD for 2-D weights, AdamW-style updates for the tied token/head table plus scalars/norm gains, GramReaperSparse (per-row RMSProp, fp32 scalar state) for Engram tables only; CUDA-graph captured.</li>
       <li><b>Memory strategy</b>: per-block <span class="m">torch.compile</span> (one graph per block/mix/engram-read — a single whole-net graph let inductor overlap all blocks' recompute buffers, ~2.5× backward peak), checkpointed mix+block units, aux-loss-free MoE balancing (dormant), bf16 autocast over an fp32 stream.</li>
       <li><b>At init</b>: every mix is a uniform average (zero queries) — expect a distinct early loss-curve shape vs the additive baseline.</li>
     </ul>

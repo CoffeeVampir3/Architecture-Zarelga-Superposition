@@ -165,7 +165,7 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
                            momentum=0.95, gain_lr=1e-3,
                            adam_betas=(0.9, 0.95), adam_eps=1e-16,
                            head_weight_decay=0.1, norm_weight_decay=0.1,
-                           embedding_lr=3e-3 * 2**0.5, embedding_beta=0.9,
+                           engram_lr=3e-3 * 2**0.5, engram_beta=0.9,
                            capture_warmup_steps=5):
     """Build dense and sparse optimizer groups for the model."""
     embedding_param = model.embedding.weight
@@ -194,7 +194,7 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
             if engram.importance_weighting:
                 engram_imp_params.append(engram.imp_table.weight)
 
-    sparse_param_ids = {id(embedding_param)}
+    sparse_param_ids = set()
     for group in engram_embed_groups:
         sparse_param_ids.add(id(group["params"][0]))
     sparse_param_ids |= {id(p) for p in engram_imp_params}
@@ -202,6 +202,12 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
     muon_params, router_params, embed_params, scalar_params, norm_gain_params = [], [], [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
+            continue
+        # A tied parameter is yielded only once by named_parameters(), under the
+        # first registered alias (`embedding.weight`), so identify it by object id
+        # and route it to the same AdamW-style group as an untied LM head.
+        if id(param) == id(embedding_param):
+            embed_params.append(param)
             continue
         if id(param) in sparse_param_ids:
             continue
@@ -248,13 +254,15 @@ def build_muonmd_optimizer(model, device, muon_lr=0.02, adam_lr=3e-4,
     )
     dense_optimizer = SingleDeviceMuonMDWithAuxAdam(param_groups)
 
-    sparse_param_groups = [dict(params=[embedding_param], unit_norm=True, row_norm_cap=0.0)]
-    sparse_param_groups.extend(engram_embed_groups)
+    sparse_param_groups = list(engram_embed_groups)
     if engram_imp_params:
         sparse_param_groups.append(dict(params=engram_imp_params, unit_norm=False, row_norm_cap=0.0))
-    sparse_optimizer = GramReaperSparse(
-        sparse_param_groups, lr=float(embedding_lr), beta=embedding_beta,
-        unit_norm=True, row_norm_cap=0.0,
+    sparse_optimizer = (
+        GramReaperSparse(
+            sparse_param_groups, lr=float(engram_lr), beta=engram_beta,
+            unit_norm=False, row_norm_cap=0.0,
+        )
+        if sparse_param_groups else None
     )
 
     return HybridGraphOptimizer(
@@ -393,7 +401,7 @@ def train(
         momentum=muon_momentum, gain_lr=gain_lr,
         adam_betas=adam_betas, adam_eps=adam_eps,
         head_weight_decay=head_weight_decay, norm_weight_decay=norm_weight_decay,
-        embedding_lr=training.embedding_lr, embedding_beta=training.embedding_beta,
+        engram_lr=training.engram_lr, engram_beta=training.engram_beta,
         capture_warmup_steps=training.capture_warmup_steps,
     )
 
@@ -444,6 +452,8 @@ def train(
         'optimizer_gain_lr': gain_lr,
         'adam_betas': adam_betas,
         'adam_eps': adam_eps,
+        'engram_lr': training.engram_lr,
+        'engram_beta': training.engram_beta,
         'weight_decay': 0.0,
         'head_weight_decay': head_weight_decay,
         'norm_weight_decay': norm_weight_decay,
