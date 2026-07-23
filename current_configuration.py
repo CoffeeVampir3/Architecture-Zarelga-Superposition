@@ -42,7 +42,7 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
         max_position_embeddings=8192,
         sequence_length=8192,
         rope_theta=100000,
-        do_rope=True,
+        do_rope=False,
         # One dense table supplies normalized token inputs and the raw LM head.
         tie_word_embeddings=True,
         pos_rope_dims=16,
@@ -57,7 +57,7 @@ def base_moe(vocab_size: int, pad_token_id: int) -> ModelConfig:
             orders=(2, 3),
             n_heads=4,
             rows_per_head=1_920_000,
-            dim_per_head=64,
+            dim_per_head=80,
             importance_weighting=True,
             head_norm=True,
             gate_mode="context_gate",
